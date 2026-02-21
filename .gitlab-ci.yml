@@ -50,14 +50,34 @@ docker:
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
   script:
-    # Build and push multi-arch images
-    - docker buildx create --use --name multiarch --driver docker-container
+    # Use pre-compiled binaries from build stage for fast Docker builds
     - |
-      docker buildx build \
-        --platform linux/amd64,linux/arm64 \
-        --tag ${DOCKER_IMAGE}:${CI_COMMIT_TAG} \
-        --tag ${DOCKER_IMAGE}:latest \
-        --push .
+      # Build amd64 image
+      cat > Dockerfile.ci <<'EOF'
+      FROM alpine:3.19
+      RUN apk --no-cache add ca-certificates tzdata
+      WORKDIR /app
+      COPY openai-converter .
+      EXPOSE 9090
+      CMD ["./openai-converter"]
+      EOF
+    - cp dist/openai-converter-linux-amd64 openai-converter
+    - docker build -f Dockerfile.ci -t ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-amd64 .
+    - docker push ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-amd64
+    # Build arm64 image
+    - cp dist/openai-converter-linux-arm64 openai-converter
+    - docker build -f Dockerfile.ci -t ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64 .
+    - docker push ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64
+    # Create and push multi-arch manifest
+    - docker manifest create ${DOCKER_IMAGE}:${CI_COMMIT_TAG} ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-amd64 ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64
+    - docker manifest annotate ${DOCKER_IMAGE}:${CI_COMMIT_TAG} ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64 --os linux --arch arm64
+    - docker manifest push ${DOCKER_IMAGE}:${CI_COMMIT_TAG}
+    - docker manifest create ${DOCKER_IMAGE}:latest ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-amd64 ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64
+    - docker manifest annotate ${DOCKER_IMAGE}:latest ${DOCKER_IMAGE}:${CI_COMMIT_TAG}-arm64 --os linux --arch arm64
+    - docker manifest push ${DOCKER_IMAGE}:latest
+  needs:
+    - job: build
+      artifacts: true
   rules:
     - if: $CI_COMMIT_TAG
 
