@@ -40,7 +40,7 @@
 
 ```bash
 # 克隆项目
-git clone <repo-url>
+git clone https://gitlab.com/viloze/open-ai-converter
 cd OPENAI_CONVERTER
 
 # 配置环境变量
