@@ -92,6 +92,22 @@ PORT=8080 docker compose up -d
 # 服务将在 http://localhost:8080 启动
 ```
 
+### 使用预构建 Docker 镜像（最简单）
+
+无需克隆代码，直接拉取镜像运行：
+
+```bash
+docker run -d --name openai-converter \
+  -p 9090:9090 \
+  -e RESPONSES_API_BASE_URL=https://your-api.com \
+  -e RESPONSES_API_KEY=sk-xxx \
+  -e COMPLETIONS_API_BASE_URL=https://api.openai.com \
+  -e COMPLETIONS_API_KEY=sk-yyy \
+  registry.gitlab.com/viloze/open-ai-converter:latest
+```
+
+支持 `linux/amd64` 和 `linux/arm64` 架构，Docker 会自动拉取适合你平台的镜像。
+
 ## 配置
 
 通过 `.env` 文件或环境变量配置（环境变量优先）：
