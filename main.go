@@ -18,8 +18,9 @@ type Config struct {
 	CompletionsAPIBaseURL string
 	CompletionsAPIKey     string
 
-	Host string
-	Port int
+	Host  string
+	Port  int
+	Debug bool
 }
 
 var cfg Config
@@ -32,6 +33,7 @@ func loadConfig() {
 	flag.StringVar(&cfg.CompletionsAPIKey, "completions-key", envOrDefault("COMPLETIONS_API_KEY", ""), "Upstream Chat Completions API key")
 	flag.StringVar(&cfg.Host, "host", envOrDefault("HOST", "0.0.0.0"), "Server host")
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
+	flag.BoolVar(&cfg.Debug, "debug", envOrDefault("DEBUG", "") != "", "Enable debug logging of converted request bodies")
 	flag.Parse()
 }
 
@@ -109,6 +111,9 @@ func main() {
 	log.Println("")
 	log.Println("  /v1/chat/completions → upstream Responses API")
 	log.Println("  /v1/responses        → upstream Chat Completions API")
+	if cfg.Debug {
+		log.Println("  DEBUG mode: ON (full request bodies logged)")
+	}
 	log.Println("========================================")
 
 	if err := http.ListenAndServe(addr, corsMiddleware(loggingMiddleware(mux))); err != nil {
@@ -138,6 +143,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		log.Printf("[%s] %s %s", r.Method, r.URL.Path, r.RemoteAddr)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// logDebugBody logs the converted request body. Full output when debug is on, truncated otherwise.
+func logDebugBody(tag string, body []byte) {
+	if cfg.Debug {
+		log.Printf("[%s] converted body:\n%s", tag, string(body))
+	}
 }
 
 // Load .env file (simple implementation, no external deps)
