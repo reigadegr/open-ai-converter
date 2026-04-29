@@ -559,6 +559,13 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 		}
 	}
 
+	// max_tokens default — ensure downstream API has a limit
+	if _, exists := chatReq["max_tokens"]; !exists {
+		if _, existsCC := chatReq["max_completion_tokens"]; !existsCC {
+			chatReq["max_tokens"] = 64000
+		}
+	}
+
 	return json.Marshal(chatReq)
 }
 
