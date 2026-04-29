@@ -533,7 +533,13 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 							}
 							chatTools = append(chatTools, ct)
 						}
+					case "web_search":
+						// web_search has no Chat Completions equivalent; log and skip
+						log.Printf("[resp→chat] skipping web_search tool (no Chat Completions equivalent)")
+
 					case "custom":
+						// Convert Responses API custom tool (e.g. apply_patch with lark grammar)
+						// into a standard function tool; embed grammar definition in description
 						name, _ := rt["name"].(string)
 						desc, _ := rt["description"].(string)
 						if format, ok := rt["format"].(map[string]interface{}); ok {
@@ -564,8 +570,10 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						}
 						chatTools = append(chatTools, ct)
 					default:
+						// Unknown tool type — log and skip
 						// web_search, file_search, code_interpreter, computer_use
 						// cannot be mapped to Chat Completions — silently skip
+						log.Printf("[resp→chat] WARNING: skipping unsupported tool type=%q name=%v", toolType, rt["name"])
 				}
 			}
 			if len(chatTools) > 0 {
