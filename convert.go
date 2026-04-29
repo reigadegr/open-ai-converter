@@ -379,6 +379,9 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						if role == "" {
 							role = "assistant"
 						}
+						if role == "developer" {
+							role = "system"
+						}
 						m := map[string]interface{}{
 							"role": role,
 						}
