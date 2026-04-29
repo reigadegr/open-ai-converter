@@ -530,8 +530,39 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 							}
 							chatTools = append(chatTools, ct)
 						}
-					// web_search, file_search, code_interpreter, computer_use
-					// cannot be mapped to Chat Completions — silently skip
+					case "custom":
+						name, _ := rt["name"].(string)
+						desc, _ := rt["description"].(string)
+						if format, ok := rt["format"].(map[string]interface{}); ok {
+							if def, ok := format["definition"].(string); ok && def != "" {
+								syntax, _ := format["syntax"].(string)
+								desc += "\n\nThis tool uses a structured grammar format (" + syntax + "). " +
+									"The argument must follow this grammar:\n" + def
+							}
+						}
+						ct := map[string]interface{}{
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":        name,
+								"description": desc,
+								"strict":      false,
+								"parameters": map[string]interface{}{
+									"type": "object",
+									"properties": map[string]interface{}{
+										"input": map[string]interface{}{
+											"type":        "string",
+											"description": "The patch content in the tool's native grammar format.",
+										},
+									},
+									"required":             []string{"input"},
+									"additionalProperties": false,
+								},
+							},
+						}
+						chatTools = append(chatTools, ct)
+					default:
+						// web_search, file_search, code_interpreter, computer_use
+						// cannot be mapped to Chat Completions — silently skip
 				}
 			}
 			if len(chatTools) > 0 {
