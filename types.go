@@ -305,6 +305,12 @@ type ResponsesCompleted struct {
 	Response ResponsesResponse `json:"response"`
 }
 
+type ResponsesOutputItemDone struct {
+	Type        string     `json:"type"`
+	OutputIndex int        `json:"output_index"`
+	Item        OutputItem `json:"item"`
+}
+
 type ResponsesFunctionCallArgsDelta struct {
 	Type        string `json:"type"`
 	ItemID      string `json:"item_id"`

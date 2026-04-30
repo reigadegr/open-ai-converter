@@ -122,10 +122,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 		if err := json.Unmarshal(respBody, &respResp); err == nil {
 			chatResp, err := ConvertResponsesRespToChatResp(&respResp)
 			if err == nil {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				w.Header().Set("Connection", "keep-alive")
-				w.Header().Set("X-Accel-Buffering", "no")
+				setSSEHeaders(w)
 				w.WriteHeader(http.StatusOK)
 
 				chatResp.Object = "chat.completion.chunk"
@@ -153,10 +150,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
+	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -273,6 +267,26 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 					Arguments: currentFuncArgs,
 				},
 			})
+
+		case "response.output_item.done":
+			// If the output item contains text content but no delta events were sent,
+			// we need to send the text as a chunk now.
+			var ev ResponsesOutputItemDone
+			json.Unmarshal([]byte(data), &ev)
+			if ev.Item.Type == "message" && firstChunk {
+				// No delta events were sent, but we have a message output
+				// Extract text from content and send it
+				for _, part := range ev.Item.Content {
+					if part.Type == "output_text" && part.Text != "" {
+						chunk := makeChatChunk(chatID, created, model)
+						chunk.Choices[0].Delta.Role = "assistant"
+						chunk.Choices[0].Delta.Content = &part.Text
+						writeSSEChunk(w, chunk)
+						flusher.Flush()
+						firstChunk = false
+					}
+				}
+			}
 
 		case "response.completed":
 			var ev ResponsesCompleted
@@ -426,38 +440,109 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		if err := json.Unmarshal(respBody, &chatResp); err == nil {
 			responsesResp, err := ConvertChatRespToResponsesResp(&chatResp)
 			if err == nil {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				w.Header().Set("Connection", "keep-alive")
-				w.Header().Set("X-Accel-Buffering", "no")
+				setSSEHeaders(w)
 				w.WriteHeader(http.StatusOK)
 
 				seqNum := 0
+				emit := func(event string, data map[string]interface{}) {
+					data["sequence_number"] = seqNum
+					writeResponsesSSE(w, event, data)
+					flusher.Flush()
+					seqNum++
+				}
+
 				responseID := generateID("resp_")
 				baseResponse := map[string]interface{}{
 					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
 					"status": responsesResp.Status, "model": model, "output": []interface{}{},
 				}
-				writeResponsesSSE(w, "response.created", map[string]interface{}{
-					"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
+				emit("response.created", map[string]interface{}{
+					"type": "response.created", "response": baseResponse,
 				})
-				flusher.Flush()
-				seqNum++
-				writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
-					"type": "response.in_progress", "response": baseResponse, "sequence_number": seqNum,
+				emit("response.in_progress", map[string]interface{}{
+					"type": "response.in_progress", "response": baseResponse,
 				})
-				flusher.Flush()
-				seqNum++
 
-				var outputItems []interface{}
-				for _, item := range responsesResp.Output {
-					outputItems = append(outputItems, item)
+				// Emit streaming events for each output item
+				for i, item := range responsesResp.Output {
+					outputIndex := i + 1
+
+					if item.Type == "message" {
+						emit("response.output_item.added", map[string]interface{}{
+							"type": "response.output_item.added", "output_index": 0,
+							"item": map[string]interface{}{
+								"id": item.ID, "type": "message", "status": "in_progress",
+								"content": []interface{}{}, "role": "assistant",
+							},
+						})
+
+						emit("response.content_part.added", map[string]interface{}{
+							"type": "response.content_part.added", "content_index": 0,
+							"item_id": item.ID, "output_index": 0,
+							"part": map[string]interface{}{
+								"type": "output_text", "annotations": []interface{}{}, "text": "",
+							},
+						})
+
+						for _, part := range item.Content {
+							if part.Type == "output_text" && part.Text != "" {
+								emit("response.output_text.delta", map[string]interface{}{
+									"type": "response.output_text.delta", "content_index": 0,
+									"item_id": item.ID, "output_index": 0,
+									"delta": part.Text,
+								})
+								emit("response.output_text.done", map[string]interface{}{
+									"type": "response.output_text.done", "content_index": 0,
+									"item_id": item.ID, "output_index": 0,
+									"text": part.Text,
+								})
+								emit("response.content_part.done", map[string]interface{}{
+									"type": "response.content_part.done", "content_index": 0,
+									"item_id": item.ID, "output_index": 0,
+									"part": map[string]interface{}{
+										"type": "output_text", "annotations": []interface{}{}, "text": part.Text,
+									},
+								})
+							}
+						}
+
+						emit("response.output_item.done", map[string]interface{}{
+							"type": "response.output_item.done", "output_index": 0,
+							"item": map[string]interface{}{
+								"id": item.ID, "type": "message", "status": "completed", "role": "assistant",
+								"content": []map[string]interface{}{
+									{"type": "output_text", "annotations": []interface{}{}, "text": item.Content[0].Text},
+								},
+							},
+						})
+
+					} else if item.Type == "function_call" {
+						emit("response.output_item.added", map[string]interface{}{
+							"type": "response.output_item.added", "output_index": outputIndex,
+							"item": map[string]interface{}{
+								"id": item.ID, "type": "function_call", "status": "in_progress",
+								"call_id": item.CallID, "name": item.Name,
+							},
+						})
+						emit("response.function_call_arguments.done", map[string]interface{}{
+							"type":    "response.function_call_arguments.done",
+							"item_id": item.ID, "output_index": outputIndex,
+							"arguments": item.Arguments,
+						})
+						emit("response.output_item.done", map[string]interface{}{
+							"type": "response.output_item.done", "output_index": outputIndex,
+							"item": map[string]interface{}{
+								"id": item.ID, "type": "function_call", "status": "completed",
+								"call_id": item.CallID, "name": item.Name, "arguments": item.Arguments,
+							},
+						})
+					}
 				}
 
 				completedResponse := map[string]interface{}{
 					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
 					"status": responsesResp.Status, "completed_at": time.Now().Unix(),
-					"model": model, "output": outputItems,
+					"model": model, "output": responsesResp.Output,
 				}
 				if responsesResp.Usage != nil {
 					completedResponse["usage"] = map[string]interface{}{
@@ -466,19 +551,15 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						"total_tokens":  responsesResp.Usage.TotalTokens,
 					}
 				}
-				writeResponsesSSE(w, "response.completed", map[string]interface{}{
-					"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+				emit("response.completed", map[string]interface{}{
+					"type": "response.completed", "response": completedResponse,
 				})
-				flusher.Flush()
 			}
 		}
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
+	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	responseID := generateID("resp_")
@@ -995,6 +1076,13 @@ func writeSSEChunk(w http.ResponseWriter, data interface{}) {
 func writeResponsesSSE(w http.ResponseWriter, event string, data interface{}) {
 	b, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+}
+
+func setSSEHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 }
 
 func makeChatChunk(id string, created int64, model string) ChatCompletionsResponse {
