@@ -541,12 +541,20 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						// Convert Responses API custom tool (e.g. apply_patch with lark grammar)
 						// into a standard function tool; embed grammar definition in description
 						name, _ := rt["name"].(string)
+						if name == "" {
+							continue
+						}
 						desc, _ := rt["description"].(string)
 						if format, ok := rt["format"].(map[string]interface{}); ok {
 							if def, ok := format["definition"].(string); ok && def != "" {
 								syntax, _ := format["syntax"].(string)
-								desc += "\n\nThis tool uses a structured grammar format (" + syntax + "). " +
-									"The argument must follow this grammar:\n" + def
+								if syntax != "" {
+									desc += "\n\nThis tool uses a structured grammar format (" + syntax + "). " +
+										"The argument must follow this grammar:\n" + def
+								} else {
+									desc += "\n\nThis tool uses a structured grammar format. " +
+										"The argument must follow this grammar:\n" + def
+								}
 							}
 						}
 						ct := map[string]interface{}{
