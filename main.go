@@ -20,7 +20,8 @@ type Config struct {
 
 	Host  string
 	Port  int
-	Debug bool
+	Debug    bool
+	SSEDebug bool
 }
 
 var cfg Config
@@ -35,6 +36,8 @@ func loadConfig() {
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
 	debugVal := strings.ToLower(strings.TrimSpace(envOrDefault("DEBUG", "")))
 	flag.BoolVar(&cfg.Debug, "debug", debugVal == "1" || debugVal == "true", "Enable debug logging of converted request bodies")
+	sseDebugVal := strings.ToLower(strings.TrimSpace(envOrDefault("SSE_DEBUG", "")))
+	cfg.SSEDebug = sseDebugVal == "1" || sseDebugVal == "true"
 	flag.Parse()
 }
 
@@ -114,6 +117,9 @@ func main() {
 	log.Println("  /v1/responses        → upstream Chat Completions API")
 	if cfg.Debug {
 		log.Println("  DEBUG mode: ON (full request bodies logged)")
+	}
+	if cfg.SSEDebug {
+		log.Println("  SSE_DEBUG mode: ON (raw upstream SSE stream logged)")
 	}
 	log.Println("========================================")
 

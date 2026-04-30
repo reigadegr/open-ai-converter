@@ -168,6 +168,9 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		if cfg.SSEDebug {
+			log.Printf("[SSE:resp→chat] %s", line)
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -627,6 +630,9 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		if cfg.SSEDebug {
+			log.Printf("[SSE:chat→resp] %s", line)
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
