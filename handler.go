@@ -465,40 +465,38 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 				// Emit streaming events for each output item
 				for i, item := range responsesResp.Output {
-					outputIndex := i + 1
 
 					if item.Type == "message" {
 						emit("response.output_item.added", map[string]interface{}{
-							"type": "response.output_item.added", "output_index": 0,
+							"type": "response.output_item.added", "output_index": i,
 							"item": map[string]interface{}{
 								"id": item.ID, "type": "message", "status": "in_progress",
 								"content": []interface{}{}, "role": "assistant",
 							},
 						})
 
-						emit("response.content_part.added", map[string]interface{}{
-							"type": "response.content_part.added", "content_index": 0,
-							"item_id": item.ID, "output_index": 0,
-							"part": map[string]interface{}{
-								"type": "output_text", "annotations": []interface{}{}, "text": "",
-							},
-						})
-
-						for _, part := range item.Content {
+						for ci, part := range item.Content {
 							if part.Type == "output_text" && part.Text != "" {
+								emit("response.content_part.added", map[string]interface{}{
+									"type": "response.content_part.added", "content_index": ci,
+									"item_id": item.ID, "output_index": i,
+									"part": map[string]interface{}{
+										"type": "output_text", "annotations": []interface{}{}, "text": "",
+									},
+								})
 								emit("response.output_text.delta", map[string]interface{}{
-									"type": "response.output_text.delta", "content_index": 0,
-									"item_id": item.ID, "output_index": 0,
+									"type": "response.output_text.delta", "content_index": ci,
+									"item_id": item.ID, "output_index": i,
 									"delta": part.Text,
 								})
 								emit("response.output_text.done", map[string]interface{}{
-									"type": "response.output_text.done", "content_index": 0,
-									"item_id": item.ID, "output_index": 0,
+									"type": "response.output_text.done", "content_index": ci,
+									"item_id": item.ID, "output_index": i,
 									"text": part.Text,
 								})
 								emit("response.content_part.done", map[string]interface{}{
-									"type": "response.content_part.done", "content_index": 0,
-									"item_id": item.ID, "output_index": 0,
+									"type": "response.content_part.done", "content_index": ci,
+									"item_id": item.ID, "output_index": i,
 									"part": map[string]interface{}{
 										"type": "output_text", "annotations": []interface{}{}, "text": part.Text,
 									},
@@ -506,19 +504,25 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 							}
 						}
 
+						// Build content array from all parts (avoids index-out-of-bounds
+						// when Content is empty, and preserves all parts instead of only the first).
+						var doneContent []map[string]interface{}
+						for _, part := range item.Content {
+							doneContent = append(doneContent, map[string]interface{}{
+								"type": part.Type, "annotations": []interface{}{}, "text": part.Text,
+							})
+						}
 						emit("response.output_item.done", map[string]interface{}{
-							"type": "response.output_item.done", "output_index": 0,
+							"type": "response.output_item.done", "output_index": i,
 							"item": map[string]interface{}{
 								"id": item.ID, "type": "message", "status": "completed", "role": "assistant",
-								"content": []map[string]interface{}{
-									{"type": "output_text", "annotations": []interface{}{}, "text": item.Content[0].Text},
-								},
+								"content": doneContent,
 							},
 						})
 
 					} else if item.Type == "function_call" {
 						emit("response.output_item.added", map[string]interface{}{
-							"type": "response.output_item.added", "output_index": outputIndex,
+							"type": "response.output_item.added", "output_index": i,
 							"item": map[string]interface{}{
 								"id": item.ID, "type": "function_call", "status": "in_progress",
 								"call_id": item.CallID, "name": item.Name,
@@ -526,11 +530,11 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						})
 						emit("response.function_call_arguments.done", map[string]interface{}{
 							"type":    "response.function_call_arguments.done",
-							"item_id": item.ID, "output_index": outputIndex,
+							"item_id": item.ID, "output_index": i,
 							"arguments": item.Arguments,
 						})
 						emit("response.output_item.done", map[string]interface{}{
-							"type": "response.output_item.done", "output_index": outputIndex,
+							"type": "response.output_item.done", "output_index": i,
 							"item": map[string]interface{}{
 								"id": item.ID, "type": "function_call", "status": "completed",
 								"call_id": item.CallID, "name": item.Name, "arguments": item.Arguments,
