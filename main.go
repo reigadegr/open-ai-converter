@@ -33,7 +33,8 @@ func loadConfig() {
 	flag.StringVar(&cfg.CompletionsAPIKey, "completions-key", envOrDefault("COMPLETIONS_API_KEY", ""), "Upstream Chat Completions API key")
 	flag.StringVar(&cfg.Host, "host", envOrDefault("HOST", "0.0.0.0"), "Server host")
 	flag.IntVar(&cfg.Port, "port", envIntOrDefault("PORT", 9090), "Server port")
-	flag.BoolVar(&cfg.Debug, "debug", envOrDefault("DEBUG", "") != "", "Enable debug logging of converted request bodies")
+	debugVal := strings.ToLower(strings.TrimSpace(envOrDefault("DEBUG", "")))
+	flag.BoolVar(&cfg.Debug, "debug", debugVal == "1" || debugVal == "true", "Enable debug logging of converted request bodies")
 	flag.Parse()
 }
 
