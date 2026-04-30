@@ -186,7 +186,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 		switch event.Type {
 		case "response.output_item.added":
 			var ev ResponsesOutputItemAdded
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 			if ev.Item.Type == "function_call" {
 				currentFuncCallID = ev.Item.CallID
 				if currentFuncCallID == "" {
@@ -200,7 +203,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 
 		case "response.output_text.delta":
 			var ev ResponsesTextDelta
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 
 			chunk := makeChatChunk(chatID, created, model)
 			if firstChunk {
@@ -216,7 +222,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			var ev struct {
 				Delta string `json:"delta"`
 			}
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 
 			chunk := makeChatChunk(chatID, created, model)
 			if firstChunk {
@@ -229,7 +238,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 
 		case "response.function_call_arguments.delta":
 			var ev ResponsesFunctionCallArgsDelta
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 			currentFuncArgs += ev.Delta
 
 			chunk := makeChatChunk(chatID, created, model)
@@ -272,7 +284,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			// If the output item contains text content but no delta events were sent,
 			// we need to send the text as a chunk now.
 			var ev ResponsesOutputItemDone
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 			if ev.Item.Type == "message" && firstChunk {
 				// No delta events were sent, but we have a message output
 				// Extract text from content and send it
@@ -290,7 +305,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 
 		case "response.completed":
 			var ev ResponsesCompleted
-			json.Unmarshal([]byte(data), &ev)
+			if err := json.Unmarshal([]byte(data), &ev); err != nil {
+				log.Printf("[Responses→Chat] failed to parse %s: %v", event.Type, err)
+				continue
+			}
 
 			finishReason := "stop"
 			if len(pendingToolCalls) > 0 {
