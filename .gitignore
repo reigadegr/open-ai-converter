@@ -1,5 +1,6 @@
 # Binary
 openai-converter
+openai-converter.exe
 
 # Environment
 .env
@@ -7,6 +8,8 @@ openai-converter
 # IDE
 .vscode/
 .idea/
+.claude/
+.go-build/
 
 # OS
 .DS_Store
