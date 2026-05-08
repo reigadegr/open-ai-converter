@@ -632,6 +632,7 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 				Type:   "message",
 				Status: "completed",
 				Role:   "assistant",
+				Phase:  "final_answer",
 			}
 
 			if msg.Refusal != nil && *msg.Refusal != "" {

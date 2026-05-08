@@ -572,7 +572,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				flusher.Flush()
 				seqNum++
 
-				var outputItems []interface{}
+				outputItems := []interface{}{}
 				for _, item := range responsesResp.Output {
 					outputItems = append(outputItems, item)
 				}
@@ -720,7 +720,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						"type": "response.output_item.added", "output_index": outputIndex,
 						"item": map[string]interface{}{
 							"id": msgID, "type": "message", "status": "in_progress",
-							"content": []interface{}{}, "role": "assistant",
+							"content": []interface{}{}, "phase": "final_answer", "role": "assistant",
 						},
 						"sequence_number": seqNum,
 					})
@@ -760,7 +760,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						"type": "response.output_item.added", "output_index": outputIndex,
 						"item": map[string]interface{}{
 							"id": msgID, "type": "message", "status": "in_progress",
-							"content": []interface{}{}, "role": "assistant",
+							"content": []interface{}{}, "phase": "final_answer", "role": "assistant",
 						},
 						"sequence_number": seqNum,
 					})
@@ -933,7 +933,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
 			"type": "response.output_item.done", "output_index": outputIndex,
 			"item": map[string]interface{}{
-				"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+				"id": msgID, "type": "message", "status": "completed", "phase": "final_answer", "role": "assistant",
 				"content": msgContent,
 			},
 			"sequence_number": seqNum,
@@ -943,7 +943,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	}
 
 	// Build final output
-	var outputItems []interface{}
+	outputItems := []interface{}{}
 	if contentPartAdded {
 		var msgContent []map[string]interface{}
 		if contentType == "refusal" {
@@ -957,7 +957,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			}
 		}
 		outputItems = append(outputItems, map[string]interface{}{
-			"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+			"id": msgID, "type": "message", "status": "completed", "phase": "final_answer", "role": "assistant",
 			"content": msgContent,
 		})
 	}
