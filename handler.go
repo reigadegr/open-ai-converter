@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -413,12 +415,15 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 	base["incomplete_details"] = nil
 	base["max_tool_calls"] = nil
 	base["moderation"] = nil
-	base["prompt_cache_key"] = nil
-	base["prompt_cache_retention"] = nil
-	base["safety_identifier"] = nil
-	base["truncation"] = nil
+	cacheKeyHash := sha256.Sum256([]byte(responseID))
+	base["prompt_cache_key"] = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		cacheKeyHash[0:4], cacheKeyHash[4:6], cacheKeyHash[6:8], cacheKeyHash[8:10], cacheKeyHash[10:16])
+	base["prompt_cache_retention"] = "24h"
+	safetyHash := sha256.Sum256([]byte(responseID + ":safety"))
+	base["safety_identifier"] = "user-" + fmt.Sprintf("%x", safetyHash[:12])
+	base["truncation"] = "disabled"
 	base["usage"] = nil
-	base["top_logprobs"] = nil
+	base["top_logprobs"] = 0
 
 	// tool_usage placeholder
 	base["tool_usage"] = map[string]interface{}{
@@ -440,7 +445,22 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 		},
 	}
 
-	// Copy fields from request
+	// Defaults for response fields
+	base["frequency_penalty"] = 0.0
+	base["max_output_tokens"] = nil
+	base["presence_penalty"] = 0.0
+	base["previous_response_id"] = nil
+	if status == "completed" {
+		base["service_tier"] = "default"
+	} else {
+		base["service_tier"] = "auto"
+	}
+	base["temperature"] = 1.0
+	base["top_p"] = 0.98
+	base["user"] = nil
+	base["metadata"] = map[string]interface{}{}
+
+	// Copy fields from request (override defaults if provided)
 	if respReq.Instructions != nil {
 		base["instructions"] = *respReq.Instructions
 	}
@@ -480,14 +500,20 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 
 	// json.RawMessage fields - unmarshal and set
 	if respReq.Reasoning != nil {
-		var v interface{}
+		var v map[string]interface{}
 		if json.Unmarshal(respReq.Reasoning, &v) == nil {
+			if _, hasSummary := v["summary"]; !hasSummary {
+				v["summary"] = nil
+			}
 			base["reasoning"] = v
 		}
 	}
 	if respReq.Text != nil {
-		var v interface{}
+		var v map[string]interface{}
 		if json.Unmarshal(respReq.Text, &v) == nil {
+			if _, hasFormat := v["format"]; !hasFormat {
+				v["format"] = map[string]interface{}{"type": "text"}
+			}
 			base["text"] = v
 		}
 	}
@@ -497,10 +523,16 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 			base["tool_choice"] = v
 		}
 	}
+	// Tools: ensure function-type tools have "type":"function"
 	if respReq.Tools != nil {
-		var v interface{}
-		if json.Unmarshal(respReq.Tools, &v) == nil {
-			base["tools"] = v
+		var tools []map[string]interface{}
+		if json.Unmarshal(respReq.Tools, &tools) == nil {
+			for _, t := range tools {
+				if _, hasType := t["type"]; !hasType {
+					t["type"] = "function"
+				}
+			}
+			base["tools"] = tools
 		}
 	}
 	if respReq.Metadata != nil {
@@ -730,7 +762,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						"type": "response.content_part.added", "content_index": 0,
 						"item_id": msgID, "output_index": outputIndex,
 						"part": map[string]interface{}{
-							"type": "output_text", "annotations": []interface{}{}, "text": "",
+							"type": "output_text", "annotations": []interface{}{}, "logprobs": []interface{}{}, "text": "",
 						},
 						"sequence_number": seqNum,
 					})
@@ -741,7 +773,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				writeResponsesSSE(w, "response.output_text.delta", map[string]interface{}{
 					"type": "response.output_text.delta", "content_index": 0,
 					"item_id": msgID, "output_index": outputIndex,
-					"delta": delta, "logprobs": []interface{}{},
+					"delta": delta, "logprobs": []interface{}{}, "obfuscation": generateObfuscation(),
 					"sequence_number": seqNum,
 				})
 				flusher.Flush()
@@ -1192,4 +1224,16 @@ func truncateLog(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func generateObfuscation() string {
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
+	}
+	for i, v := range b {
+		b[i] = chars[v%byte(len(chars))]
+	}
+	return string(b)
 }
