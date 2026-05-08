@@ -102,7 +102,7 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 	}
 
 	if chatReq.Temperature != nil {
-		respReq["temperature"] = *chatReq.Temperature
+		respReq["temperature"] = float64ToInt(*chatReq.Temperature)
 	}
 
 	// n parameter: Responses API only supports single output
@@ -114,10 +114,10 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) ([]byte, err
 		respReq["top_p"] = *chatReq.TopP
 	}
 	if chatReq.FrequencyPenalty != nil {
-		respReq["frequency_penalty"] = *chatReq.FrequencyPenalty
+		respReq["frequency_penalty"] = float64ToInt(*chatReq.FrequencyPenalty)
 	}
 	if chatReq.PresencePenalty != nil {
-		respReq["presence_penalty"] = *chatReq.PresencePenalty
+		respReq["presence_penalty"] = float64ToInt(*chatReq.PresencePenalty)
 	}
 
 	// stop → (no direct equivalent, but some implementations accept it)
@@ -414,16 +414,16 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 		chatReq["max_completion_tokens"] = *respReq.MaxOutputTokens
 	}
 	if respReq.Temperature != nil {
-		chatReq["temperature"] = *respReq.Temperature
+		chatReq["temperature"] = float64ToInt(*respReq.Temperature)
 	}
 	if respReq.TopP != nil {
 		chatReq["top_p"] = *respReq.TopP
 	}
 	if respReq.FrequencyPenalty != nil {
-		chatReq["frequency_penalty"] = *respReq.FrequencyPenalty
+		chatReq["frequency_penalty"] = float64ToInt(*respReq.FrequencyPenalty)
 	}
 	if respReq.PresencePenalty != nil {
-		chatReq["presence_penalty"] = *respReq.PresencePenalty
+		chatReq["presence_penalty"] = float64ToInt(*respReq.PresencePenalty)
 	}
 
 	// store

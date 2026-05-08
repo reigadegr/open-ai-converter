@@ -18,6 +18,14 @@ import (
 
 // ==================== Direction 1: /v1/chat/completions → upstream /v1/responses ====================
 
+// float64ToInt converts a float64 to int if it's an integer value, otherwise returns the float64
+func float64ToInt(f float64) interface{} {
+	if f == float64(int(f)) {
+		return int(f)
+	}
+	return f
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractAPIKey(r)
 	if apiKey == "" {
@@ -446,16 +454,16 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 	}
 
 	// Defaults for response fields
-	base["frequency_penalty"] = 0.0
+	base["frequency_penalty"] = 0
 	base["max_output_tokens"] = nil
-	base["presence_penalty"] = 0.0
+	base["presence_penalty"] = 0
 	base["previous_response_id"] = nil
 	if status == "completed" {
 		base["service_tier"] = "default"
 	} else {
 		base["service_tier"] = "auto"
 	}
-	base["temperature"] = 1.0
+	base["temperature"] = 1
 	base["top_p"] = 0.98
 	base["user"] = nil
 	base["metadata"] = map[string]interface{}{}
@@ -465,7 +473,7 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 		base["instructions"] = *respReq.Instructions
 	}
 	if respReq.Temperature != nil {
-		base["temperature"] = *respReq.Temperature
+		base["temperature"] = float64ToInt(*respReq.Temperature)
 	}
 	if respReq.TopP != nil {
 		base["top_p"] = *respReq.TopP
@@ -474,10 +482,10 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 		base["max_output_tokens"] = *respReq.MaxOutputTokens
 	}
 	if respReq.FrequencyPenalty != nil {
-		base["frequency_penalty"] = *respReq.FrequencyPenalty
+		base["frequency_penalty"] = float64ToInt(*respReq.FrequencyPenalty)
 	}
 	if respReq.PresencePenalty != nil {
-		base["presence_penalty"] = *respReq.PresencePenalty
+		base["presence_penalty"] = float64ToInt(*respReq.PresencePenalty)
 	}
 	if respReq.ParallelToolCalls != nil {
 		base["parallel_tool_calls"] = *respReq.ParallelToolCalls
