@@ -91,10 +91,11 @@ type ChatChoice struct {
 }
 
 type ChatDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   *string    `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	Refusal   *string    `json:"refusal,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          *string    `json:"content,omitempty"`
+	ReasoningContent *string    `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	Refusal          *string    `json:"refusal,omitempty"`
 }
 
 type ChatUsage struct {
