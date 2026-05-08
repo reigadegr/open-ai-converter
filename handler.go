@@ -444,35 +444,11 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 	if respReq.Instructions != nil {
 		base["instructions"] = *respReq.Instructions
 	}
-	if respReq.Temperature != nil {
-		base["temperature"] = *respReq.Temperature
-	}
-	if respReq.TopP != nil {
-		base["top_p"] = *respReq.TopP
-	}
-	if respReq.MaxOutputTokens != nil {
-		base["max_output_tokens"] = *respReq.MaxOutputTokens
-	}
-	if respReq.FrequencyPenalty != nil {
-		base["frequency_penalty"] = *respReq.FrequencyPenalty
-	}
-	if respReq.PresencePenalty != nil {
-		base["presence_penalty"] = *respReq.PresencePenalty
-	}
 	if respReq.ParallelToolCalls != nil {
 		base["parallel_tool_calls"] = *respReq.ParallelToolCalls
 	}
 	if respReq.Store != nil {
 		base["store"] = *respReq.Store
-	}
-	if respReq.ServiceTier != nil {
-		base["service_tier"] = *respReq.ServiceTier
-	}
-	if respReq.PreviousResponseID != nil {
-		base["previous_response_id"] = *respReq.PreviousResponseID
-	}
-	if respReq.User != nil {
-		base["user"] = *respReq.User
 	}
 	if respReq.TopLogprobs != nil {
 		base["top_logprobs"] = *respReq.TopLogprobs
@@ -501,12 +477,6 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 		var v interface{}
 		if json.Unmarshal(respReq.Tools, &v) == nil {
 			base["tools"] = v
-		}
-	}
-	if respReq.Metadata != nil {
-		var v interface{}
-		if json.Unmarshal(respReq.Metadata, &v) == nil {
-			base["metadata"] = v
 		}
 	}
 	if respReq.Truncation != nil {
