@@ -45,6 +45,7 @@ type ChatMessage struct {
 	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Refusal    *string         `json:"refusal,omitempty"`
+	ReasoningContent *string  `json:"reasoning_content,omitempty"`
 }
 
 type ToolCall struct {

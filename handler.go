@@ -395,6 +395,29 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[resp→chat] model=%s stream=%v", respReq.Model, respReq.Stream)
 
+	// Guard: skip empty input — some upstreams hang on empty user messages
+	if respReq.Input == nil || isEmptyInput(respReq.Input) {
+		log.Printf("[resp→chat] skip empty-input request")
+		responseID := generateID("resp_")
+		created := nowUnix()
+		baseResponse := map[string]interface{}{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": created,
+			"status":     "completed",
+			"model":      respReq.Model,
+			"output":     []interface{}{},
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+				"total_tokens":  0,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(baseResponse)
+		return
+	}
+
 	chatBody, err := ConvertResponsesToChatRequest(&respReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
@@ -603,6 +626,26 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 }
 
 func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, respReq *ResponsesRequest) {
+	// Feature 7: Stream error recovery — send structured SSE error event on panic
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[resp→chat] stream panic: %v", rec)
+			errMsg := fmt.Sprintf("%v", rec)
+			if flusher, ok := w.(http.Flusher); ok {
+				errEvent := map[string]interface{}{
+					"type": "error",
+					"error": map[string]interface{}{
+						"message": errMsg,
+						"code":    500,
+					},
+				}
+				b, _ := json.Marshal(errEvent)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				flusher.Flush()
+			}
+		}
+	}()
+
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -612,9 +655,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+		writeError(w, resp.StatusCode, "upstream error: "+string(body))
 		return
 	}
 
@@ -962,6 +1003,22 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		}
 	}
 
+	// Feature 7: Check for scanner errors (stream interruption)
+	if err := scanner.Err(); err != nil {
+		log.Printf("[resp→chat] stream read error: %v", err)
+		errEvent := map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"message": fmt.Sprintf("Upstream stream error: %v", err),
+				"code":    500,
+			},
+		}
+		b, _ := json.Marshal(errEvent)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+		return
+	}
+
 	// Finalize tool calls in deterministic order
 	toolCallIndices := make([]int, 0, len(toolCallMap))
 	for idx := range toolCallMap {
@@ -1110,7 +1167,14 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			},
 		})
 	}
-	if contentPartAdded {
+
+	// Feature 8: display_text fallback — use reasoning if no text content emitted
+	displayText := fullText.String()
+	if displayText == "" && fullReasoning.String() != "" {
+		displayText = fullReasoning.String()
+	}
+
+	if contentPartAdded || (hasReasoningContent && displayText != "") {
 		var msgContent []map[string]interface{}
 		if contentType == "refusal" {
 			msgContent = []map[string]interface{}{
@@ -1119,7 +1183,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		} else {
 			msgContent = []map[string]interface{}{
 				{"type": "output_text", "annotations": []interface{}{},
-					"logprobs": []interface{}{}, "text": fullText.String()},
+					"logprobs": []interface{}{}, "text": displayText},
 			}
 		}
 		outputItems = append(outputItems, map[string]interface{}{
@@ -1370,4 +1434,19 @@ func generateObfuscation() string {
 		b[i] = chars[v%byte(len(chars))]
 	}
 	return string(b)
+}
+
+// isEmptyInput checks if the input field is empty (string "" or empty array)
+func isEmptyInput(input json.RawMessage) bool {
+	// Try as string
+	var s string
+	if err := json.Unmarshal(input, &s); err == nil {
+		return s == ""
+	}
+	// Try as array
+	var arr []json.RawMessage
+	if err := json.Unmarshal(input, &arr); err == nil {
+		return len(arr) == 0
+	}
+	return false
 }

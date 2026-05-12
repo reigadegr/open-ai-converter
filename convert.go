@@ -623,6 +623,19 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 			respResp.IncompleteDetails = json.RawMessage(`{"reason":"max_output_tokens"}`)
 		}
 
+		// Add reasoning output item if present (e.g., DeepSeek reasoning_content)
+		if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+			summaryJSON, _ := json.Marshal([]map[string]interface{}{
+				{"type": "summary_text", "text": *msg.ReasoningContent},
+			})
+			respResp.Output = append(respResp.Output, OutputItem{
+				ID:      generateID("rs_"),
+				Type:    "reasoning",
+				Status:  "completed",
+				Summary: summaryJSON,
+			})
+		}
+
 		// Add message output item
 		text := contentToString(msg.Content)
 		hasText := text != ""
