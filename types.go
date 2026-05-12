@@ -182,6 +182,7 @@ type ResponsesInputMessage struct {
 	Name      string          `json:"name,omitempty"`
 	Arguments string          `json:"arguments,omitempty"`
 	Status    string          `json:"status,omitempty"`
+	Summary   json.RawMessage `json:"summary,omitempty"`
 }
 
 type ResponsesResponse struct {

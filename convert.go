@@ -346,12 +346,56 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 			var inputMsgs []json.RawMessage
 			if err := json.Unmarshal(respReq.Input, &inputMsgs); err == nil {
 				// Process each input message with type awareness
+				var pendingReasoning string // reasoning text to attach to next assistant message
+				var pendingToolCalls []map[string]interface{} // accumulated function_call items
+
+				flushToolCalls := func() {
+					if len(pendingToolCalls) == 0 {
+						return
+					}
+					m := map[string]interface{}{
+						"role":       "assistant",
+						"tool_calls": pendingToolCalls,
+					}
+					if pendingReasoning != "" {
+						m["reasoning_content"] = pendingReasoning
+						pendingReasoning = ""
+					}
+					messages = append(messages, m)
+					pendingToolCalls = nil
+				}
+
 				for _, rawMsg := range inputMsgs {
 					var im ResponsesInputMessage
 					json.Unmarshal(rawMsg, &im)
 
 					switch {
+					case im.Type == "reasoning":
+						// Extract reasoning text from summary and hold for next assistant message
+						if im.Summary != nil {
+							var summary []struct {
+								Type string `json:"type"`
+								Text string `json:"text"`
+							}
+							if json.Unmarshal(im.Summary, &summary) == nil {
+								var parts []string
+								for _, s := range summary {
+									if s.Text != "" {
+										parts = append(parts, s.Text)
+									}
+								}
+								if len(parts) > 0 {
+									if pendingReasoning != "" {
+										pendingReasoning += "\n" + strings.Join(parts, "\n")
+									} else {
+										pendingReasoning = strings.Join(parts, "\n")
+									}
+								}
+							}
+						}
+
 					case im.Type == "function_call_output":
+						flushToolCalls()
 						messages = append(messages, map[string]interface{}{
 							"role":         "tool",
 							"content":      im.Output,
@@ -359,22 +403,17 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 						})
 
 					case im.Type == "function_call":
-						m := map[string]interface{}{
-							"role": "assistant",
-							"tool_calls": []map[string]interface{}{
-								{
-									"id":   im.CallID,
-									"type": "function",
-									"function": map[string]interface{}{
-										"name":      im.Name,
-										"arguments": im.Arguments,
-									},
-								},
+						pendingToolCalls = append(pendingToolCalls, map[string]interface{}{
+							"id":   im.CallID,
+							"type": "function",
+							"function": map[string]interface{}{
+								"name":      im.Name,
+								"arguments": im.Arguments,
 							},
-						}
-						messages = append(messages, m)
+						})
 
 					default:
+						flushToolCalls()
 						role := im.Role
 						if role == "" {
 							role = "assistant"
@@ -398,9 +437,15 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 								}
 							}
 						}
+						// Attach pending reasoning_content to the next assistant message
+						if pendingReasoning != "" && role == "assistant" {
+							m["reasoning_content"] = pendingReasoning
+							pendingReasoning = ""
+						}
 						messages = append(messages, m)
 					}
 				}
+				flushToolCalls()
 			}
 		}
 	}
