@@ -200,6 +200,13 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 		}
 
 		switch event.Type {
+		case "response.created":
+			chunk := makeChatChunk(chatID, created, model)
+			chunk.Choices[0].Delta.Role = "assistant"
+			firstChunk = false
+			writeSSEChunk(w, chunk)
+			flusher.Flush()
+
 		case "response.output_item.added":
 			var ev ResponsesOutputItemAdded
 			json.Unmarshal([]byte(data), &ev)
@@ -227,6 +234,26 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			writeSSEChunk(w, chunk)
 			flusher.Flush()
 
+		case "response.content_part.delta":
+			// Skip text_delta here; response.output_text.delta handles text.
+			// Only process refusal (no dedicated lower-level event for it).
+			var ev struct {
+				Delta map[string]interface{} `json:"delta"`
+			}
+			json.Unmarshal([]byte(data), &ev)
+			if ev.Delta != nil && ev.Delta["type"] == "refusal" {
+				if refusal, ok := ev.Delta["refusal"].(string); ok && refusal != "" {
+					chunk := makeChatChunk(chatID, created, model)
+					if firstChunk {
+						chunk.Choices[0].Delta.Role = "assistant"
+						firstChunk = false
+					}
+					chunk.Choices[0].Delta.Refusal = &refusal
+					writeSSEChunk(w, chunk)
+					flusher.Flush()
+				}
+			}
+
 		case "response.refusal.delta":
 			// Refusal streaming (Responses API)
 			var ev struct {
@@ -242,6 +269,22 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			chunk.Choices[0].Delta.Refusal = &ev.Delta
 			writeSSEChunk(w, chunk)
 			flusher.Flush()
+
+		case "response.reasoning_summary_text.delta":
+			var ev struct {
+				Delta string `json:"delta"`
+			}
+			json.Unmarshal([]byte(data), &ev)
+			if ev.Delta != "" {
+				chunk := makeChatChunk(chatID, created, model)
+				if firstChunk {
+					chunk.Choices[0].Delta.Role = "assistant"
+					firstChunk = false
+				}
+				chunk.Choices[0].Delta.ReasoningContent = &ev.Delta
+				writeSSEChunk(w, chunk)
+				flusher.Flush()
+			}
 
 		case "response.function_call_arguments.delta":
 			var ev ResponsesFunctionCallArgsDelta
@@ -677,6 +720,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	var finishReasonSeen bool
 	var contentPartAdded bool
 	var contentType string // "output_text" or "refusal"
+	var reasoningID string
 	var reasoningEmitted bool
 	var hasReasoningContent bool
 
@@ -712,26 +756,63 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		}
 
 		if choice.Delta != nil && !finishReasonSeen {
-			// Reasoning content (P2)
+			// Reasoning content — stream as response.reasoning_summary_text.delta
 			if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
 				reasoningDelta := *choice.Delta.ReasoningContent
 				fullReasoning.WriteString(reasoningDelta)
 				hasReasoningContent = true
-				// We accumulate reasoning but don't emit it as a stream;
-				// we'll emit a placeholder reasoning item before the message if present
+
+				if !reasoningEmitted {
+					reasoningEmitted = true
+					reasoningID = generateID("rs_")
+					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added", "output_index": outputIndex,
+						"item": map[string]interface{}{
+							"id": reasoningID, "type": "reasoning", "status": "in_progress",
+							"encrypted_content": "", "summary": []interface{}{},
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
+						"type": "response.content_part.added", "content_index": 0,
+						"item_id": reasoningID, "output_index": outputIndex,
+						"part": map[string]interface{}{
+							"type": "summary_text", "text": "",
+						},
+						"sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+				}
+
+				writeResponsesSSE(w, "response.reasoning_summary_text.delta", map[string]interface{}{
+					"type": "response.reasoning_summary_text.delta", "content_index": 0,
+					"item_id": reasoningID, "output_index": outputIndex,
+					"delta": reasoningDelta, "sequence_number": seqNum,
+				})
+				flusher.Flush()
+				seqNum++
 			}
 
 			// Text content
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
-				// Emit reasoning item placeholder before first text delta
-				if hasReasoningContent && !reasoningEmitted {
-					reasoningEmitted = true
-					reasoningID := generateID("rs_")
-					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added", "output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id": reasoningID, "type": "reasoning",
-							"encrypted_content": "", "summary": []interface{}{},
+				// Complete reasoning item before first text delta
+				if hasReasoningContent && reasoningEmitted {
+					reasoningEmitted = false // prevent re-entry
+					writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
+						"type": "response.reasoning_summary_text.done", "content_index": 0,
+						"item_id": reasoningID, "output_index": outputIndex,
+						"text": fullReasoning.String(), "sequence_number": seqNum,
+					})
+					flusher.Flush()
+					seqNum++
+					writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+						"type": "response.content_part.done", "content_index": 0,
+						"item_id": reasoningID, "output_index": outputIndex,
+						"part": map[string]interface{}{
+							"type": "summary_text", "text": fullReasoning.String(),
 						},
 						"sequence_number": seqNum,
 					})
@@ -740,8 +821,10 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
 						"type": "response.output_item.done", "output_index": outputIndex,
 						"item": map[string]interface{}{
-							"id": reasoningID, "type": "reasoning",
-							"encrypted_content": "", "summary": []interface{}{},
+							"id": reasoningID, "type": "reasoning", "status": "completed",
+							"encrypted_content": "", "summary": []interface{}{
+								map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
+							},
 						},
 						"sequence_number": seqNum,
 					})
@@ -910,6 +993,41 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		seqNum++
 	}
 
+	// Finalize reasoning item if still open (stream ended without text content)
+	if hasReasoningContent && reasoningEmitted {
+		reasoningEmitted = false
+		writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
+			"type": "response.reasoning_summary_text.done", "content_index": 0,
+			"item_id": reasoningID, "output_index": outputIndex,
+			"text": fullReasoning.String(), "sequence_number": seqNum,
+		})
+		flusher.Flush()
+		seqNum++
+		writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+			"type": "response.content_part.done", "content_index": 0,
+			"item_id": reasoningID, "output_index": outputIndex,
+			"part": map[string]interface{}{
+				"type": "summary_text", "text": fullReasoning.String(),
+			},
+			"sequence_number": seqNum,
+		})
+		flusher.Flush()
+		seqNum++
+		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "output_index": outputIndex,
+			"item": map[string]interface{}{
+				"id": reasoningID, "type": "reasoning", "status": "completed",
+				"encrypted_content": "", "summary": []interface{}{
+					map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
+				},
+			},
+			"sequence_number": seqNum,
+		})
+		flusher.Flush()
+		seqNum++
+		outputIndex++
+	}
+
 	// Finalize message content (conditional on whether content was emitted)
 	if contentPartAdded {
 		if contentType == "refusal" {
@@ -984,6 +1102,14 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	// Build final output
 	outputItems := []interface{}{}
+	if hasReasoningContent {
+		outputItems = append(outputItems, map[string]interface{}{
+			"id": reasoningID, "type": "reasoning", "status": "completed",
+			"encrypted_content": "", "summary": []interface{}{
+				map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
+			},
+		})
+	}
 	if contentPartAdded {
 		var msgContent []map[string]interface{}
 		if contentType == "refusal" {
