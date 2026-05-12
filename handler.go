@@ -636,13 +636,19 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		}
 	}()
 
-	// ── Pre-send: emit initial SSE events before upstream request ──
-	// In large-context scenarios, upstream connection establishment can
-	// take 200ms+. Sending initial events immediately prevents clients
-	// (e.g. Codex CLI) from timing out due to silent period.
-	// Only response.created + response.in_progress are sent here.
-	// output_item.added is deferred to the main loop where outputIndex
-	// is known (reasoning may occupy index 0).
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		writeError(w, resp.StatusCode, "upstream error: "+string(body))
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
@@ -676,23 +682,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	})
 	seqNum++
 
-	// Single flush for all pre-send events
 	flusher.Flush()
-
-	// ── Now establish upstream connection ──
-	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
-	if err != nil {
-		writeSSEError(w, flusher, 502, "upstream error: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("[resp→chat] upstream error %d: %s", resp.StatusCode, truncateLog(string(body), 1000))
-		writeSSEError(w, flusher, resp.StatusCode, string(body))
-		return
-	}
 
 	// Fallback: if upstream returned JSON instead of SSE, convert to Responses SSE events
 	upstreamContentType := resp.Header.Get("Content-Type")
