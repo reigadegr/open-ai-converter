@@ -630,93 +630,22 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("[resp→chat] stream panic: %v", rec)
-			errMsg := fmt.Sprintf("%v", rec)
 			if flusher, ok := w.(http.Flusher); ok {
-				errEvent := map[string]interface{}{
-					"type": "error",
-					"error": map[string]interface{}{
-						"message": errMsg,
-						"code":    500,
-					},
-				}
-				b, _ := json.Marshal(errEvent)
-				fmt.Fprintf(w, "data: %s\n\n", b)
-				flusher.Flush()
+				writeSSEError(w, flusher, 500, fmt.Sprintf("%v", rec))
 			}
 		}
 	}()
 
-	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		writeError(w, resp.StatusCode, "upstream error: "+string(body))
-		return
-	}
-
+	// ── Pre-send: emit initial SSE events before upstream request ──
+	// In large-context scenarios, upstream connection establishment can
+	// take 200ms+. Sending initial events immediately prevents clients
+	// (e.g. Codex CLI) from timing out due to silent period.
+	// Only response.created + response.in_progress are sent here.
+	// output_item.added is deferred to the main loop where outputIndex
+	// is known (reasoning may occupy index 0).
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-
-	// Fallback: if upstream returned JSON instead of SSE, convert to Responses SSE events
-	upstreamContentType := resp.Header.Get("Content-Type")
-	if strings.HasPrefix(upstreamContentType, "application/json") {
-		respBody, _ := io.ReadAll(resp.Body)
-		var chatResp ChatCompletionsResponse
-		if err := json.Unmarshal(respBody, &chatResp); err == nil {
-			responsesResp, err := ConvertChatRespToResponsesResp(&chatResp)
-			if err == nil {
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Cache-Control", "no-cache")
-				w.Header().Set("Connection", "keep-alive")
-				w.Header().Set("X-Accel-Buffering", "no")
-				w.WriteHeader(http.StatusOK)
-
-				seqNum := 0
-				responseID := generateID("resp_")
-				created := nowUnix()
-				baseResponse := buildBaseResponse(respReq, responseID, created, "completed")
-				baseResponse["completed_at"] = time.Now().Unix()
-
-				writeResponsesSSE(w, "response.created", map[string]interface{}{
-					"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
-				})
-				flusher.Flush()
-				seqNum++
-				writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
-					"type": "response.in_progress", "response": baseResponse, "sequence_number": seqNum,
-				})
-				flusher.Flush()
-				seqNum++
-
-				outputItems := []interface{}{}
-				for _, item := range responsesResp.Output {
-					outputItems = append(outputItems, item)
-				}
-
-				completedResponse := buildBaseResponse(respReq, responseID, created, responsesResp.Status)
-				completedResponse["completed_at"] = time.Now().Unix()
-				completedResponse["output"] = outputItems
-				if responsesResp.Usage != nil {
-					completedResponse["usage"] = map[string]interface{}{
-						"input_tokens":  responsesResp.Usage.InputTokens,
-						"output_tokens": responsesResp.Usage.OutputTokens,
-						"total_tokens":  responsesResp.Usage.TotalTokens,
-					}
-				}
-				writeResponsesSSE(w, "response.completed", map[string]interface{}{
-					"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
-				})
-				flusher.Flush()
-			}
-		}
 		return
 	}
 
@@ -730,23 +659,76 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	msgID := generateID("msg_")
 	created := nowUnix()
 	seqNum := 0
-	outputIndex := 0 // tracks current output_index
+	outputIndex := 0
 
+	// response.created — full response object per API spec
 	baseResponse := buildBaseResponse(respReq, responseID, created, "in_progress")
-
-	// response.created
 	writeResponsesSSE(w, "response.created", map[string]interface{}{
 		"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
 	})
-	flusher.Flush()
 	seqNum++
 
-	// response.in_progress
+	// response.in_progress — lightweight status notification (matches jibdx)
 	writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
-		"type": "response.in_progress", "response": baseResponse, "sequence_number": seqNum,
+		"type": "response.in_progress", "response": map[string]interface{}{
+			"id": responseID, "object": "response", "status": "in_progress", "model": respReq.Model,
+		}, "sequence_number": seqNum,
 	})
-	flusher.Flush()
 	seqNum++
+
+	// Single flush for all pre-send events
+	flusher.Flush()
+
+	// ── Now establish upstream connection ──
+	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
+	if err != nil {
+		writeSSEError(w, flusher, 502, "upstream error: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[resp→chat] upstream error %d: %s", resp.StatusCode, truncateLog(string(body), 1000))
+		writeSSEError(w, flusher, resp.StatusCode, string(body))
+		return
+	}
+
+	// Fallback: if upstream returned JSON instead of SSE, convert to Responses SSE events
+	upstreamContentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(upstreamContentType, "application/json") {
+		respBody, _ := io.ReadAll(resp.Body)
+		var chatResp ChatCompletionsResponse
+		if err := json.Unmarshal(respBody, &chatResp); err != nil {
+			writeSSEError(w, flusher, 502, "failed to parse upstream JSON response: "+err.Error())
+			return
+		}
+		responsesResp, err := ConvertChatRespToResponsesResp(&chatResp)
+		if err != nil {
+			writeSSEError(w, flusher, 500, "conversion error: "+err.Error())
+			return
+		}
+		outputItems := []interface{}{}
+		for _, item := range responsesResp.Output {
+			outputItems = append(outputItems, item)
+		}
+
+		completedResponse := buildBaseResponse(respReq, responseID, created, responsesResp.Status)
+		completedResponse["completed_at"] = time.Now().Unix()
+		completedResponse["output"] = outputItems
+		if responsesResp.Usage != nil {
+			completedResponse["usage"] = map[string]interface{}{
+				"input_tokens":  responsesResp.Usage.InputTokens,
+				"output_tokens": responsesResp.Usage.OutputTokens,
+				"total_tokens":  responsesResp.Usage.TotalTokens,
+			}
+		}
+		writeResponsesSSE(w, "response.completed", map[string]interface{}{
+			"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+		})
+		flusher.Flush()
+		return
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -1006,16 +988,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	// Feature 7: Check for scanner errors (stream interruption)
 	if err := scanner.Err(); err != nil {
 		log.Printf("[resp→chat] stream read error: %v", err)
-		errEvent := map[string]interface{}{
-			"type": "error",
-			"error": map[string]interface{}{
-				"message": fmt.Sprintf("Upstream stream error: %v", err),
-				"code":    500,
-			},
-		}
-		b, _ := json.Marshal(errEvent)
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
+		writeSSEError(w, flusher, 500, fmt.Sprintf("Upstream stream error: %v", err))
 		return
 	}
 
@@ -1400,6 +1373,19 @@ func writeSSEChunk(w http.ResponseWriter, data interface{}) {
 func writeResponsesSSE(w http.ResponseWriter, event string, data interface{}) {
 	b, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+}
+
+func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code int, message string) {
+	errEvent := map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"message": message,
+			"code":    code,
+		},
+	}
+	b, _ := json.Marshal(errEvent)
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
 }
 
 func makeChatChunk(id string, created int64, model string) ChatCompletionsResponse {
