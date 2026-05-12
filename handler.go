@@ -716,6 +716,16 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		completedResponse := buildBaseResponse(respReq, responseID, created, responsesResp.Status)
 		completedResponse["completed_at"] = time.Now().Unix()
 		completedResponse["output"] = outputItems
+		// Build output_text from output items (mirrors SSE path's displayText)
+		var displayText string
+		for _, item := range responsesResp.Output {
+			for _, part := range item.Content {
+				if part.Type == "output_text" || part.Type == "text" {
+					displayText += part.Text
+				}
+			}
+		}
+		completedResponse["output_text"] = displayText
 		if responsesResp.Usage != nil {
 			completedResponse["usage"] = map[string]interface{}{
 				"input_tokens":  responsesResp.Usage.InputTokens,
@@ -743,6 +753,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	var finishReasonSeen bool
 	var contentPartAdded bool
 	var contentType string // "output_text" or "refusal"
+	var contentIndex int   // tracks content part index within an output item
 	var reasoningID string
 	var reasoningEmitted bool
 	var hasReasoningContent bool
@@ -854,6 +865,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					flusher.Flush()
 					seqNum++
 					outputIndex++
+					contentIndex = 0 // reset for new output item
 				}
 
 				delta := *choice.Delta.Content
@@ -873,7 +885,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					flusher.Flush()
 					seqNum++
 					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
-						"type": "response.content_part.added", "content_index": 0,
+						"type": "response.content_part.added", "content_index": contentIndex,
 						"item_id": msgID, "output_index": outputIndex,
 						"part": map[string]interface{}{
 							"type": "output_text", "annotations": []interface{}{}, "logprobs": []interface{}{}, "text": "",
@@ -885,7 +897,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				}
 
 				writeResponsesSSE(w, "response.output_text.delta", map[string]interface{}{
-					"type": "response.output_text.delta", "content_index": 0,
+					"type": "response.output_text.delta", "content_index": contentIndex,
 					"item_id": msgID, "output_index": outputIndex,
 					"delta": delta, "logprobs": []interface{}{}, "obfuscation": generateObfuscation(),
 					"sequence_number": seqNum,
@@ -913,7 +925,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					flusher.Flush()
 					seqNum++
 					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
-						"type": "response.content_part.added", "content_index": 0,
+						"type": "response.content_part.added", "content_index": contentIndex,
 						"item_id": msgID, "output_index": outputIndex,
 						"part": map[string]interface{}{
 							"type": "refusal", "refusal": "",
@@ -925,7 +937,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				}
 
 				writeResponsesSSE(w, "response.refusal.delta", map[string]interface{}{
-					"type": "response.refusal.delta", "content_index": 0,
+					"type": "response.refusal.delta", "content_index": contentIndex,
 					"item_id": msgID, "output_index": outputIndex,
 					"delta": refusalDelta, "sequence_number": seqNum,
 				})
@@ -1063,7 +1075,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		if contentType == "refusal" {
 			// refusal.done
 			writeResponsesSSE(w, "response.refusal.done", map[string]interface{}{
-				"type": "response.refusal.done", "content_index": 0,
+				"type": "response.refusal.done", "content_index": contentIndex,
 				"item_id": msgID, "output_index": outputIndex,
 				"refusal": fullRefusal.String(), "sequence_number": seqNum,
 			})
@@ -1072,7 +1084,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 			// content_part.done (refusal)
 			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-				"type": "response.content_part.done", "content_index": 0,
+				"type": "response.content_part.done", "content_index": contentIndex,
 				"item_id": msgID, "output_index": outputIndex,
 				"part": map[string]interface{}{
 					"type": "refusal", "refusal": fullRefusal.String(),
@@ -1084,7 +1096,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		} else {
 			// output_text.done (P0-2)
 			writeResponsesSSE(w, "response.output_text.done", map[string]interface{}{
-				"type": "response.output_text.done", "content_index": 0,
+				"type": "response.output_text.done", "content_index": contentIndex,
 				"item_id": msgID, "output_index": outputIndex,
 				"text": fullText.String(), "logprobs": []interface{}{},
 				"sequence_number": seqNum,
@@ -1094,7 +1106,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 			// content_part.done (P0-3)
 			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-				"type": "response.content_part.done", "content_index": 0,
+				"type": "response.content_part.done", "content_index": contentIndex,
 				"item_id": msgID, "output_index": outputIndex,
 				"part": map[string]interface{}{
 					"type": "output_text", "annotations": []interface{}{},
@@ -1210,6 +1222,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	completedResponse := buildBaseResponse(respReq, responseID, created, finalStatus)
 	completedResponse["completed_at"] = time.Now().Unix()
 	completedResponse["output"] = outputItems
+	completedResponse["output_text"] = displayText
 	completedResponse["usage"] = usage
 	if finalStatus == "incomplete" {
 		completedResponse["incomplete_details"] = map[string]interface{}{
@@ -1222,7 +1235,6 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	})
 	flusher.Flush()
 }
-
 
 // ==================== Pass-through ====================
 
