@@ -450,6 +450,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) ([]byte, error) {
 		}
 	}
 
+	messages = cleanupOrphanedToolCalls(messages)
 	chatReq["messages"] = messages
 
 	// ---- Parameter mapping ----
@@ -963,6 +964,104 @@ func convertTextToResponseFormat(text json.RawMessage) interface{} {
 }
 
 // ==================== Helpers ====================
+
+// cleanupOrphanedToolCalls removes tool_calls from assistant messages that lack
+// matching tool result messages, and removes tool result messages that reference
+// tool_calls no longer present. This prevents upstream API 400 errors when
+// conversation history has been compacted and tool results were lost.
+// Note: modifies the "tool_calls" field of input message maps in place.
+func cleanupOrphanedToolCalls(messages []map[string]interface{}) []map[string]interface{} {
+	// Collect all tool_call_ids that have matching tool results.
+	toolResultIDs := make(map[string]bool)
+	for _, m := range messages {
+		if role, _ := m["role"].(string); role == "tool" {
+			if tcid, ok := m["tool_call_id"].(string); ok && tcid != "" {
+				toolResultIDs[tcid] = true
+			}
+		}
+	}
+
+	cleaned := make([]map[string]interface{}, 0, len(messages))
+	for _, m := range messages {
+		role, _ := m["role"].(string)
+		rawTC, hasToolCalls := m["tool_calls"]
+
+		if role != "assistant" || !hasToolCalls {
+			cleaned = append(cleaned, m)
+			continue
+		}
+
+		toolCalls, ok := rawTC.([]map[string]interface{})
+		if !ok {
+			cleaned = append(cleaned, m)
+			continue
+		}
+
+		// Keep only tool_calls that have a matching result.
+		var validCalls []map[string]interface{}
+		for _, tc := range toolCalls {
+			id, _ := tc["id"].(string)
+			if id != "" && toolResultIDs[id] {
+				validCalls = append(validCalls, tc)
+			}
+		}
+
+		if len(validCalls) > 0 {
+			m["tool_calls"] = validCalls
+			cleaned = append(cleaned, m)
+			continue
+		}
+
+		// All tool_calls are orphaned. Keep the message only if it has
+		// text content or reasoning content; otherwise drop it entirely.
+		hasContent := false
+		if c, ok := m["content"]; ok && c != nil {
+			if s, ok := c.(string); ok {
+				hasContent = s != ""
+			} else {
+				hasContent = true // structured content (array, etc.)
+			}
+		}
+		hasReasoning := false
+		if r, ok := m["reasoning_content"]; ok && r != nil {
+			if s, ok := r.(string); ok {
+				hasReasoning = s != ""
+			}
+		}
+
+		if hasContent || hasReasoning {
+			delete(m, "tool_calls")
+			cleaned = append(cleaned, m)
+		}
+		// else: drop the empty assistant message entirely
+	}
+
+	// Reverse pass: remove tool result messages whose tool_call_id is no
+	// longer referenced by any remaining assistant message's tool_calls.
+	// After the forward pass, orphaned calls were stripped; any tool result
+	// referencing a removed call would trigger an upstream 400 error.
+	validIDs := make(map[string]bool)
+	for _, m := range cleaned {
+		if rawTC, ok := m["tool_calls"].([]map[string]interface{}); ok {
+			for _, tc := range rawTC {
+				if id, _ := tc["id"].(string); id != "" {
+					validIDs[id] = true
+				}
+			}
+		}
+	}
+	var final []map[string]interface{}
+	for _, m := range cleaned {
+		if role, _ := m["role"].(string); role == "tool" {
+			if tcid, _ := m["tool_call_id"].(string); tcid != "" && !validIDs[tcid] {
+				continue // drop orphaned tool result
+			}
+		}
+		final = append(final, m)
+	}
+
+	return final
+}
 
 func convertID(id, prefix string) string {
 	if strings.HasPrefix(id, prefix) {
