@@ -160,8 +160,8 @@ type ResponsesRequest struct {
 	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
 	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
 	User               *string         `json:"user,omitempty"`
-	Reasoning          json.RawMessage `json:"reasoning,omitempty"`
-	Text               json.RawMessage `json:"text,omitempty"`
+	Reasoning          *ResponsesReasoning `json:"reasoning,omitempty"`
+	Text               json.RawMessage     `json:"text,omitempty"`
 	Truncation         json.RawMessage `json:"truncation,omitempty"`
 	Store              *bool           `json:"store,omitempty"`
 	Metadata           json.RawMessage `json:"metadata,omitempty"`
@@ -170,6 +170,10 @@ type ResponsesRequest struct {
 	PreviousResponseID *string         `json:"previous_response_id,omitempty"`
 	ServiceTier        *string         `json:"service_tier,omitempty"`
 	TopLogprobs        *int            `json:"top_logprobs,omitempty"`
+	Include            []string        `json:"include,omitempty"`
+	Stop               json.RawMessage `json:"stop,omitempty"`
+	Seed               *int            `json:"seed,omitempty"`
+	StreamOptions      *StreamOptions  `json:"stream_options,omitempty"`
 }
 
 type ResponsesInputMessage struct {
@@ -201,23 +205,25 @@ type ResponsesResponse struct {
 	ToolChoice        json.RawMessage `json:"tool_choice,omitempty"`
 	Tools             json.RawMessage `json:"tools,omitempty"`
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
-	ServiceTier       string          `json:"service_tier,omitempty"`
-	IncompleteDetails json.RawMessage `json:"incomplete_details,omitempty"`
-	Reasoning         json.RawMessage `json:"reasoning,omitempty"`
-	Text              json.RawMessage `json:"text,omitempty"`
+	ServiceTier       string                      `json:"service_tier,omitempty"`
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Reasoning         json.RawMessage             `json:"reasoning,omitempty"`
+	Text              json.RawMessage             `json:"text,omitempty"`
 }
 
 type OutputItem struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Status    string          `json:"status,omitempty"`
-	Role      string          `json:"role,omitempty"`
-	Phase     string          `json:"phase,omitempty"`
-	Content   []ContentPart   `json:"content,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments string          `json:"arguments,omitempty"`
-	CallID    string          `json:"call_id,omitempty"`
-	Summary   json.RawMessage `json:"summary,omitempty"`
+	ID               string              `json:"id"`
+	Type             string              `json:"type"`
+	Status           string              `json:"status,omitempty"`
+	Role             string              `json:"role,omitempty"`
+	Phase            string              `json:"phase,omitempty"`
+	Content          []ContentPart       `json:"content,omitempty"`
+	Name             string              `json:"name,omitempty"`
+	Arguments        string              `json:"arguments,omitempty"`
+	CallID           string              `json:"call_id,omitempty"`
+	Summary          []ResponsesSummary  `json:"summary,omitempty"`
+	EncryptedContent string              `json:"encrypted_content,omitempty"`
+	Action           *WebSearchAction    `json:"action,omitempty"`
 }
 
 type ContentPart struct {
@@ -288,35 +294,75 @@ type ReasoningConfig struct {
 	Summary string `json:"summary,omitempty"`
 }
 
+type ResponsesReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason"` // "max_output_tokens" | "content_filter"
+}
+
+type ResponsesSummary struct {
+	Type string `json:"type"` // "summary_text"
+	Text string `json:"text"`
+}
+
+type WebSearchAction struct {
+	Type  string `json:"type,omitempty"`
+	Query string `json:"query,omitempty"`
+}
+
+type ResponsesTool struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name,omitempty"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
+	Tools       []ResponsesTool `json:"tools,omitempty"` // for namespace type
+}
+
 // ==================== Streaming Event Types ====================
 
-type ResponsesTextDelta struct {
-	Type         string `json:"type"`
-	ContentIndex int    `json:"content_index"`
-	OutputIndex  int    `json:"output_index"`
-	Delta        string `json:"delta"`
-	ItemID       string `json:"item_id"`
+// ResponsesStreamEvent is a unified SSE event struct for Responses API streaming.
+type ResponsesStreamEvent struct {
+	Type           string             `json:"type"`
+	Response       *ResponsesResponse `json:"response,omitempty"`
+	Item           *OutputItem        `json:"item,omitempty"`
+	OutputIndex    int                `json:"output_index,omitempty"`
+	ContentIndex   int                `json:"content_index,omitempty"`
+	Delta          string             `json:"delta,omitempty"`
+	Text           string             `json:"text,omitempty"`
+	ItemID         string             `json:"item_id,omitempty"`
+	CallID         string             `json:"call_id,omitempty"`
+	Name           string             `json:"name,omitempty"`
+	Arguments      string             `json:"arguments,omitempty"`
+	SummaryIndex   int                `json:"summary_index,omitempty"`
+	SequenceNumber int                `json:"sequence_number,omitempty"`
 }
 
-type ResponsesOutputItemAdded struct {
-	Type        string     `json:"type"`
-	OutputIndex int        `json:"output_index"`
-	Item        OutputItem `json:"item"`
+// ChatCompletionsChunk is a streaming chunk for Chat Completions SSE.
+type ChatCompletionsChunk struct {
+	ID                string            `json:"id"`
+	Object            string            `json:"object"` // "chat.completion.chunk"
+	Created           int64             `json:"created"`
+	Model             string            `json:"model"`
+	Choices           []ChatChunkChoice `json:"choices"`
+	Usage             *ChatUsage        `json:"usage,omitempty"`
+	SystemFingerprint string            `json:"system_fingerprint,omitempty"`
+	ServiceTier       string            `json:"service_tier,omitempty"`
 }
 
-type ResponsesCompleted struct {
-	Type     string            `json:"type"`
-	Response ResponsesResponse `json:"response"`
-}
-
-type ResponsesFunctionCallArgsDelta struct {
-	Type        string `json:"type"`
-	ItemID      string `json:"item_id"`
-	OutputIndex int    `json:"output_index"`
-	Delta       string `json:"delta"`
+// ChatChunkChoice is a single choice in a streaming chunk.
+type ChatChunkChoice struct {
+	Index        int        `json:"index"`
+	Delta        ChatDelta  `json:"delta"`
+	FinishReason *string    `json:"finish_reason"`
 }
 
 // ==================== Helpers ====================
+
+const minMaxOutputTokens = 128
 
 func strPtr(s string) *string       { return &s }
 func intPtr(i int) *int             { return &i }
@@ -326,6 +372,11 @@ func nowUnix() int64                { return time.Now().Unix() }
 
 func jsonString(s string) json.RawMessage {
 	b, _ := json.Marshal(s)
+	return b
+}
+
+func mustMarshal(v interface{}) []byte {
+	b, _ := json.Marshal(v)
 	return b
 }
 

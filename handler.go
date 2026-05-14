@@ -47,9 +47,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[chat→resp] model=%s stream=%v messages=%d", chatReq.Model, chatReq.Stream, len(chatReq.Messages))
 
-	respBody, err := ConvertChatToResponsesRequest(&chatReq)
+	respReq, err := ConvertChatToResponsesRequest(&chatReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		return
+	}
+	respBody, err := json.Marshal(respReq)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "marshal error: "+err.Error())
 		return
 	}
 
@@ -169,18 +174,12 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	// Use streaming state machine to convert Responses SSE events → Chat chunks
+	state := NewResponsesEventToChatState()
+	state.Model = model
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	chatID := generateID("chatcmpl-")
-	created := nowUnix()
-	firstChunk := true
-	var pendingToolCalls []ToolCall
-	currentFuncName := ""
-	currentFuncArgs := ""
-	currentFuncCallID := ""
-	currentFuncIndex := 0
-	sentFirstToolDelta := make(map[int]bool) // track per-tool first delta
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -188,183 +187,31 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			continue
 		}
 		data := strings.TrimPrefix(line, "data: ")
-		if data == "" {
+		if data == "" || data == "[DONE]" {
 			continue
 		}
 
-		var event struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
+		var evt ResponsesStreamEvent
+		if err := json.Unmarshal([]byte(data), &evt); err != nil {
 			continue
 		}
 
-		switch event.Type {
-		case "response.created":
-			chunk := makeChatChunk(chatID, created, model)
-			chunk.Choices[0].Delta.Role = "assistant"
-			firstChunk = false
+		chunks := ResponsesEventToChatChunks(&evt, state)
+		for _, chunk := range chunks {
 			writeSSEChunk(w, chunk)
 			flusher.Flush()
+		}
 
-		case "response.output_item.added":
-			var ev ResponsesOutputItemAdded
-			json.Unmarshal([]byte(data), &ev)
-			if ev.Item.Type == "function_call" {
-				currentFuncCallID = ev.Item.CallID
-				if currentFuncCallID == "" {
-					currentFuncCallID = ev.Item.ID
-				}
-				currentFuncName = ev.Item.Name
-				currentFuncArgs = ""
-				currentFuncIndex = ev.OutputIndex
-				sentFirstToolDelta[currentFuncIndex] = false
-			}
+		if state.Finalized {
+			break
+		}
+	}
 
-		case "response.output_text.delta":
-			var ev ResponsesTextDelta
-			json.Unmarshal([]byte(data), &ev)
-
-			chunk := makeChatChunk(chatID, created, model)
-			if firstChunk {
-				chunk.Choices[0].Delta.Role = "assistant"
-				firstChunk = false
-			}
-			chunk.Choices[0].Delta.Content = &ev.Delta
+	// Safety net: finalize if stream ended without completion event
+	if chunks := FinalizeResponsesChatStream(state); chunks != nil {
+		for _, chunk := range chunks {
 			writeSSEChunk(w, chunk)
 			flusher.Flush()
-
-		case "response.content_part.delta":
-			// Skip text_delta here; response.output_text.delta handles text.
-			// Only process refusal (no dedicated lower-level event for it).
-			var ev struct {
-				Delta map[string]interface{} `json:"delta"`
-			}
-			json.Unmarshal([]byte(data), &ev)
-			if ev.Delta != nil && ev.Delta["type"] == "refusal" {
-				if refusal, ok := ev.Delta["refusal"].(string); ok && refusal != "" {
-					chunk := makeChatChunk(chatID, created, model)
-					if firstChunk {
-						chunk.Choices[0].Delta.Role = "assistant"
-						firstChunk = false
-					}
-					chunk.Choices[0].Delta.Refusal = &refusal
-					writeSSEChunk(w, chunk)
-					flusher.Flush()
-				}
-			}
-
-		case "response.refusal.delta":
-			// Refusal streaming (Responses API)
-			var ev struct {
-				Delta string `json:"delta"`
-			}
-			json.Unmarshal([]byte(data), &ev)
-
-			chunk := makeChatChunk(chatID, created, model)
-			if firstChunk {
-				chunk.Choices[0].Delta.Role = "assistant"
-				firstChunk = false
-			}
-			chunk.Choices[0].Delta.Refusal = &ev.Delta
-			writeSSEChunk(w, chunk)
-			flusher.Flush()
-
-		case "response.reasoning_summary_text.delta":
-			var ev struct {
-				Delta string `json:"delta"`
-			}
-			json.Unmarshal([]byte(data), &ev)
-			if ev.Delta != "" {
-				chunk := makeChatChunk(chatID, created, model)
-				if firstChunk {
-					chunk.Choices[0].Delta.Role = "assistant"
-					firstChunk = false
-				}
-				chunk.Choices[0].Delta.ReasoningContent = &ev.Delta
-				writeSSEChunk(w, chunk)
-				flusher.Flush()
-			}
-
-		case "response.function_call_arguments.delta":
-			var ev ResponsesFunctionCallArgsDelta
-			json.Unmarshal([]byte(data), &ev)
-			currentFuncArgs += ev.Delta
-
-			chunk := makeChatChunk(chatID, created, model)
-			if firstChunk {
-				chunk.Choices[0].Delta.Role = "assistant"
-				firstChunk = false
-			}
-
-			idx := currentFuncIndex
-			tc := ToolCall{
-				Index: &idx,
-				Function: FunctionCall{
-					Arguments: ev.Delta,
-				},
-			}
-
-			// Only send ID, type, and name on the first delta for each tool call
-			if !sentFirstToolDelta[currentFuncIndex] {
-				tc.ID = currentFuncCallID
-				tc.Type = "function"
-				tc.Function.Name = currentFuncName
-				sentFirstToolDelta[currentFuncIndex] = true
-			}
-
-			chunk.Choices[0].Delta.ToolCalls = []ToolCall{tc}
-			writeSSEChunk(w, chunk)
-			flusher.Flush()
-
-		case "response.function_call_arguments.done":
-			pendingToolCalls = append(pendingToolCalls, ToolCall{
-				ID:   currentFuncCallID,
-				Type: "function",
-				Function: FunctionCall{
-					Name:      currentFuncName,
-					Arguments: currentFuncArgs,
-				},
-			})
-
-		case "response.completed":
-			var ev ResponsesCompleted
-			json.Unmarshal([]byte(data), &ev)
-
-			finishReason := "stop"
-			if len(pendingToolCalls) > 0 {
-				finishReason = "tool_calls"
-			}
-			if ev.Response.Status == "incomplete" {
-				finishReason = "length"
-			}
-
-			finalChunk := makeChatChunk(chatID, created, model)
-			finalChunk.Choices[0].FinishReason = &finishReason
-
-			if ev.Response.Usage != nil {
-				finalChunk.Usage = &ChatUsage{
-					PromptTokens:     ev.Response.Usage.InputTokens,
-					CompletionTokens: ev.Response.Usage.OutputTokens,
-					TotalTokens:      ev.Response.Usage.TotalTokens,
-				}
-				if ev.Response.Usage.OutputTokensDetails != nil {
-					finalChunk.Usage.CompletionTokensDetails = &CompletionTokensDetails{
-						ReasoningTokens: ev.Response.Usage.OutputTokensDetails.ReasoningTokens,
-					}
-				}
-				if ev.Response.Usage.InputTokensDetails != nil {
-					finalChunk.Usage.PromptTokensDetails = &PromptTokensDetails{
-						CachedTokens: ev.Response.Usage.InputTokensDetails.CachedTokens,
-					}
-				}
-			}
-
-			writeSSEChunk(w, finalChunk)
-			flusher.Flush()
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
 		}
 	}
 
@@ -418,9 +265,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatBody, err := ConvertResponsesToChatRequest(&respReq)
+	chatReq, err := ConvertResponsesToChatRequest(&respReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
+		return
+	}
+	chatBody, err := json.Marshal(chatReq)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "marshal error: "+err.Error())
 		return
 	}
 
@@ -572,15 +424,17 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 		base["top_logprobs"] = *respReq.TopLogprobs
 	}
 
-	// json.RawMessage fields - unmarshal and set
+	// Reasoning field - now a strong type
 	if respReq.Reasoning != nil {
-		var v map[string]interface{}
-		if json.Unmarshal(respReq.Reasoning, &v) == nil {
-			if _, hasSummary := v["summary"]; !hasSummary {
-				v["summary"] = nil
-			}
-			base["reasoning"] = v
+		v := map[string]interface{}{
+			"effort": respReq.Reasoning.Effort,
 		}
+		if respReq.Reasoning.Summary != "" {
+			v["summary"] = respReq.Reasoning.Summary
+		} else {
+			v["summary"] = nil
+		}
+		base["reasoning"] = v
 	}
 	if respReq.Text != nil {
 		var v map[string]interface{}
@@ -1358,21 +1212,6 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code int, messag
 	b, _ := json.Marshal(errEvent)
 	fmt.Fprintf(w, "data: %s\n\n", b)
 	flusher.Flush()
-}
-
-func makeChatChunk(id string, created int64, model string) ChatCompletionsResponse {
-	return ChatCompletionsResponse{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: created,
-		Model:   model,
-		Choices: []ChatChoice{
-			{
-				Index: 0,
-				Delta: &ChatDelta{},
-			},
-		},
-	}
 }
 
 func truncateLog(s string, maxLen int) string {
