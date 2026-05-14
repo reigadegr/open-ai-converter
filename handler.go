@@ -49,7 +49,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[chat→resp] converted body: %s", truncateLog(string(respBody), 2000))
+	log.Printf("[chat→resp] converted body: %s", string(respBody))
 
 	upstreamURL := cfg.ResponsesAPIBaseURL + "/v1/responses"
 
@@ -249,7 +249,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[resp→chat] converted body: %s", truncateLog(string(chatBody), 500))
+	log.Printf("[resp→chat] converted body: %s", string(chatBody))
 
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
