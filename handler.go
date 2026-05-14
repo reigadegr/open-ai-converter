@@ -408,6 +408,21 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 }
 
 func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+	var sseStarted bool
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[resp→chat] stream panic: %v", rec)
+			if sseStarted {
+				if flusher, ok := w.(http.Flusher); ok {
+					writeSSEError(w, http.StatusInternalServerError, fmt.Sprintf("%v", rec))
+					flusher.Flush()
+				}
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("stream panic: %v", rec))
+			}
+		}
+	}()
+
 	resp, err := doUpstreamRequest(r, url, apiKey, reqBody, true)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
@@ -442,6 +457,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				w.Header().Set("Connection", "keep-alive")
 				w.Header().Set("X-Accel-Buffering", "no")
 				w.WriteHeader(http.StatusOK)
+				sseStarted = true
 
 				seqNum := 0
 				responseID := generateID("resp_")
@@ -491,6 +507,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	sseStarted = true
 
 	responseID := generateID("resp_")
 	msgID := generateID("msg_")
@@ -781,6 +798,22 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				}
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[resp→chat] stream read error: %v", err)
+		completedResponse := map[string]interface{}{
+			"id": responseID, "object": "response", "created_at": created,
+			"status": "failed", "completed_at": time.Now().Unix(),
+			"model": model, "output": []interface{}{},
+			"incomplete_details": map[string]interface{}{"reason": "upstream_stream_error"},
+		}
+		writeResponsesSSE(w, "response.completed", map[string]interface{}{
+			"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+		})
+		writeSSEError(w, http.StatusInternalServerError, fmt.Sprintf("upstream stream error: %v", err))
+		flusher.Flush()
+		return
 	}
 
 	reasoningText := fullReasoning.String()
@@ -1155,6 +1188,18 @@ func writeSSEChunk(w http.ResponseWriter, data interface{}) {
 func writeResponsesSSE(w http.ResponseWriter, event string, data interface{}) {
 	b, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+}
+
+func writeSSEError(w http.ResponseWriter, code int, msg string) {
+	errEvent := map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"message": msg,
+			"code":    code,
+		},
+	}
+	b, _ := json.Marshal(errEvent)
+	fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
 }
 
 func truncateLog(s string, maxLen int) string {
