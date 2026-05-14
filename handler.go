@@ -203,25 +203,9 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 		switch typeBuf.Type {
 
 		// High-frequency delta events — use minimal structs
-		case "response.output_text.delta":
-			var td responsesTextDeltaEvent
-			if json.Unmarshal(raw, &td) == nil {
-				evt.Type = td.Type
-				evt.Delta = td.Delta
-				evt.OutputIndex = td.OutputIndex
-				evt.ContentIndex = td.ContentIndex
-				evt.ItemID = td.ItemID
-			}
-		case "response.content_part.delta":
-			var td responsesTextDeltaEvent
-			if json.Unmarshal(raw, &td) == nil {
-				evt.Type = td.Type
-				evt.Delta = td.Delta
-				evt.OutputIndex = td.OutputIndex
-				evt.ContentIndex = td.ContentIndex
-				evt.ItemID = td.ItemID
-			}
-		case "response.refusal.delta":
+		case "response.output_text.delta",
+			"response.content_part.delta",
+			"response.refusal.delta":
 			var td responsesTextDeltaEvent
 			if json.Unmarshal(raw, &td) == nil {
 				evt.Type = td.Type

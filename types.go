@@ -216,7 +216,6 @@ type OutputItem struct {
 	Type              string              `json:"type"`
 	Status            string              `json:"status,omitempty"`
 	Role              string              `json:"role,omitempty"`
-	Phase             string              `json:"phase,omitempty"`
 	Content           []ContentPart       `json:"content,omitempty"`
 	Name              string              `json:"name,omitempty"`
 	Arguments         string              `json:"arguments,omitempty"`
