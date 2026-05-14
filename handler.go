@@ -878,7 +878,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						"type": "response.content_part.added", "content_index": contentIndex,
 						"item_id": msgID, "output_index": outputIndex,
 						"part": map[string]interface{}{
-							"type": "output_text", "text": "",
+							"type": "output_text", "annotations": []interface{}{}, "text": "",
 						},
 						"sequence_number": seqNum,
 					})
@@ -1065,31 +1065,56 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		displayText = fullReasoning.String()
 	}
 
-	// Finalize message content_part.done + output_item.done (matches jibdx)
+	// Finalize message content: output_text.done / refusal.done → content_part.done → output_item.done
 	if contentPartAdded || (hasReasoningContent && displayText != "") {
-		var donePartType string
 		if contentType == "refusal" {
-			donePartType = "refusal"
-		} else if fullText.Len() > 0 {
-			donePartType = "output_text"
-		} else {
-			donePartType = "reasoning_text"
-		}
-		donePartText := displayText
-		if contentType == "refusal" {
-			donePartText = fullRefusal.String()
-		}
+			writeResponsesSSE(w, "response.refusal.done", map[string]interface{}{
+				"type": "response.refusal.done", "content_index": contentIndex,
+				"item_id": msgID, "output_index": outputIndex,
+				"refusal": fullRefusal.String(), "sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
 
-		writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-			"type": "response.content_part.done", "content_index": contentIndex,
-			"item_id": msgID, "output_index": outputIndex,
-			"part": map[string]interface{}{
-				"type": donePartType, "text": donePartText,
-			},
-			"sequence_number": seqNum,
-		})
-		flusher.Flush()
-		seqNum++
+			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": contentIndex,
+				"item_id": msgID, "output_index": outputIndex,
+				"part": map[string]interface{}{
+					"type": "refusal", "refusal": fullRefusal.String(),
+				},
+				"sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
+		} else {
+			donePartType := "output_text"
+			doneText := displayText
+			if fullText.Len() == 0 && hasReasoningContent {
+				donePartType = "reasoning_text"
+			}
+
+			writeResponsesSSE(w, "response."+donePartType+".done", map[string]interface{}{
+				"type": "response." + donePartType + ".done", "content_index": contentIndex,
+				"item_id": msgID, "output_index": outputIndex,
+				"text": doneText, "sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
+
+			donePart := map[string]interface{}{
+				"type": donePartType, "text": doneText,
+			}
+			if donePartType == "output_text" {
+				donePart["annotations"] = []interface{}{}
+			}
+			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": contentIndex,
+				"item_id": msgID, "output_index": outputIndex,
+				"part": donePart, "sequence_number": seqNum,
+			})
+			flusher.Flush()
+			seqNum++
+		}
 	}
 
 	// output_item.done for message (matches jibdx — no phase field)
