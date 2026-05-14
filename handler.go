@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -181,6 +180,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+	// Two-pass SSE deserialization: first extract type, then use lightweight structs
+	// for high-frequency events to avoid deserializing heavy nested fields.
+	var typeBuf struct{ Type string `json:"type"` }
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -191,8 +194,112 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			continue
 		}
 
+		raw := []byte(data)
+
+		// Pass 1: extract event type only
+		typeBuf.Type = ""
+		if err := json.Unmarshal(raw, &typeBuf); err != nil {
+			continue
+		}
+
+		// Pass 2: deserialize to lightweight struct based on event type
 		var evt ResponsesStreamEvent
-		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+		switch typeBuf.Type {
+
+		// High-frequency delta events — use minimal structs
+		case "response.output_text.delta":
+			var td responsesTextDeltaEvent
+			if json.Unmarshal(raw, &td) == nil {
+				evt.Type = td.Type
+				evt.Delta = td.Delta
+				evt.OutputIndex = td.OutputIndex
+				evt.ContentIndex = td.ContentIndex
+				evt.ItemID = td.ItemID
+			}
+		case "response.function_call_arguments.delta":
+			var fd responsesFuncArgsDeltaEvent
+			if json.Unmarshal(raw, &fd) == nil {
+				evt.Type = fd.Type
+				evt.Delta = fd.Delta
+				evt.OutputIndex = fd.OutputIndex
+				evt.ItemID = fd.ItemID
+			}
+		case "response.reasoning_summary_text.delta":
+			var rd responsesReasoningDeltaEvent
+			if json.Unmarshal(raw, &rd) == nil {
+				evt.Type = rd.Type
+				evt.Delta = rd.Delta
+				evt.OutputIndex = rd.OutputIndex
+				evt.ContentIndex = rd.ContentIndex
+				evt.ItemID = rd.ItemID
+			}
+
+		// output_item.added — use lightweight item (no Content/Summary/Action arrays)
+		case "response.output_item.added":
+			var oa responsesOutputItemAddedEvent
+			if json.Unmarshal(raw, &oa) == nil {
+				evt.Type = oa.Type
+				evt.OutputIndex = oa.OutputIndex
+				if oa.Item != nil {
+					evt.Item = &OutputItem{
+						ID:     oa.Item.ID,
+						Type:   oa.Item.Type,
+						Status: oa.Item.Status,
+						Name:   oa.Item.Name,
+						CallID: oa.Item.CallID,
+					}
+				}
+			}
+
+		// Terminal events — use lightweight struct (no Output []OutputItem)
+		case "response.completed", "response.done",
+			"response.incomplete", "response.failed":
+			var ce responsesCompletedEvent
+			if json.Unmarshal(raw, &ce) == nil {
+				evt.Type = ce.Type
+				if ce.Response != nil {
+					resp := &ResponsesResponse{
+						ID:                ce.Response.ID,
+						Model:             ce.Response.Model,
+						Status:            ce.Response.Status,
+						IncompleteDetails: ce.Response.IncompleteDetails,
+					}
+					if ce.Response.Usage != nil {
+						u := ce.Response.Usage
+						resp.Usage = &ResponsesUsage{
+							InputTokens:         u.InputTokens,
+							OutputTokens:        u.OutputTokens,
+							TotalTokens:         u.TotalTokens,
+							InputTokensDetails:  u.InputTokensDetails,
+							OutputTokensDetails: u.OutputTokensDetails,
+						}
+					}
+					evt.Response = resp
+				}
+			}
+
+		// response.created — only needs ID and Model from Response
+		case "response.created":
+			var cr struct {
+				Type     string `json:"type"`
+				Response struct {
+					ID    string `json:"id"`
+					Model string `json:"model"`
+				} `json:"response"`
+			}
+			if json.Unmarshal(raw, &cr) == nil {
+				evt.Type = cr.Type
+				if cr.Response.ID != "" || cr.Response.Model != "" {
+					evt.Response = &ResponsesResponse{
+						ID:    cr.Response.ID,
+						Model: cr.Response.Model,
+					}
+				}
+			}
+
+		default:
+			// Unknown event type — skip full deserialization entirely.
+			// ResponsesEventToChatChunks returns nil for unknown types anyway.
 			continue
 		}
 
@@ -1219,18 +1326,6 @@ func truncateLog(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
-}
-
-func generateObfuscation() string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, 10)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%010d", time.Now().UnixNano()%1e10)
-	}
-	for i, v := range b {
-		b[i] = chars[v%byte(len(chars))]
-	}
-	return string(b)
 }
 
 // isEmptyInput checks if the input field is empty (string "" or empty array)

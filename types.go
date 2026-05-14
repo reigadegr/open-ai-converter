@@ -289,11 +289,6 @@ type TextFormatSpec struct {
 
 // ==================== Reasoning Types ====================
 
-type ReasoningConfig struct {
-	Effort  string `json:"effort,omitempty"`
-	Summary string `json:"summary,omitempty"`
-}
-
 type ResponsesReasoning struct {
 	Effort  string `json:"effort,omitempty"`
 	Summary string `json:"summary,omitempty"`
@@ -325,6 +320,7 @@ type ResponsesTool struct {
 // ==================== Streaming Event Types ====================
 
 // ResponsesStreamEvent is a unified SSE event struct for Responses API streaming.
+// Used as an intermediate representation consumed by ResponsesEventToChatChunks.
 type ResponsesStreamEvent struct {
 	Type           string             `json:"type"`
 	Response       *ResponsesResponse `json:"response,omitempty"`
@@ -339,6 +335,78 @@ type ResponsesStreamEvent struct {
 	Arguments      string             `json:"arguments,omitempty"`
 	SummaryIndex   int                `json:"summary_index,omitempty"`
 	SequenceNumber int                `json:"sequence_number,omitempty"`
+}
+
+// ---- Lightweight SSE event structs for two-pass deserialization ----
+// These avoid deserializing heavy nested fields (Response, OutputItem)
+// for high-frequency delta events that only need a few scalar values.
+
+// responsesTextDeltaEvent is a minimal struct for response.output_text.delta events.
+type responsesTextDeltaEvent struct {
+	Type         string `json:"type"`
+	Delta        string `json:"delta"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	ItemID       string `json:"item_id"`
+}
+
+// responsesFuncArgsDeltaEvent is a minimal struct for response.function_call_arguments.delta events.
+type responsesFuncArgsDeltaEvent struct {
+	Type        string `json:"type"`
+	Delta       string `json:"delta"`
+	OutputIndex int    `json:"output_index"`
+	ItemID      string `json:"item_id"`
+}
+
+// responsesReasoningDeltaEvent is a minimal struct for response.reasoning_summary_text.delta events.
+type responsesReasoningDeltaEvent struct {
+	Type         string `json:"type"`
+	Delta        string `json:"delta"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	ItemID       string `json:"item_id"`
+}
+
+// responsesOutputItemAddedEvent is a minimal struct for response.output_item.added events.
+type responsesOutputItemAddedEvent struct {
+	Type        string                      `json:"type"`
+	OutputIndex int                         `json:"output_index"`
+	Item        *responsesOutputItemMinimal `json:"item,omitempty"`
+}
+
+// responsesOutputItemMinimal contains only the fields accessed by resToChatHandleOutputItemAdded,
+// avoiding deserialization of Content, Summary, Action arrays.
+type responsesOutputItemMinimal struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Status string `json:"status,omitempty"`
+	Name   string `json:"name,omitempty"`
+	CallID string `json:"call_id,omitempty"`
+}
+
+// responsesCompletedEvent is a minimal struct for response.completed / response.done /
+// response.incomplete / response.failed events. Avoids deserializing the full Output array.
+type responsesCompletedEvent struct {
+	Type     string                      `json:"type"`
+	Response *responsesCompletedResponse `json:"response,omitempty"`
+}
+
+// responsesCompletedResponse contains only the fields accessed by resToChatHandleCompleted.
+type responsesCompletedResponse struct {
+	ID                string                     `json:"id"`
+	Model             string                     `json:"model"`
+	Status            string                     `json:"status"`
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Usage             *responsesCompletedUsage    `json:"usage,omitempty"`
+}
+
+// responsesCompletedUsage contains only the usage fields accessed by resToChatHandleCompleted.
+type responsesCompletedUsage struct {
+	InputTokens         int                  `json:"input_tokens"`
+	OutputTokens        int                  `json:"output_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
 }
 
 // ChatCompletionsChunk is a streaming chunk for Chat Completions SSE.
@@ -364,11 +432,7 @@ type ChatChunkChoice struct {
 
 const minMaxOutputTokens = 128
 
-func strPtr(s string) *string       { return &s }
-func intPtr(i int) *int             { return &i }
-func boolPtr(b bool) *bool          { return &b }
-func float64Ptr(f float64) *float64 { return &f }
-func nowUnix() int64                { return time.Now().Unix() }
+func nowUnix() int64 { return time.Now().Unix() }
 
 func jsonString(s string) json.RawMessage {
 	b, _ := json.Marshal(s)
