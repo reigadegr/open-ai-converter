@@ -320,7 +320,7 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 	}
 
 	var textParts []string
-	var reasoningText string
+	var reasoningBuf strings.Builder
 	var toolCalls []ToolCall
 	var refusal *string
 
@@ -351,7 +351,7 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 		case "reasoning":
 			for _, s := range item.Summary {
 				if s.Type == "summary_text" && s.Text != "" {
-					reasoningText += s.Text
+					reasoningBuf.WriteString(s.Text)
 				}
 			}
 		case "web_search_call":
@@ -374,8 +374,9 @@ func ConvertResponsesRespToChatResp(respResp *ResponsesResponse) (*ChatCompletio
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
 	}
-	if reasoningText != "" {
-		msg.ReasoningContent = reasoningText
+	if reasoningBuf.Len() > 0 {
+		reasoningText := reasoningBuf.String()
+		msg.ReasoningContent = &reasoningText
 	}
 
 	chatResp.Choices = []ChatChoice{
@@ -454,33 +455,79 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 		} else {
 			var inputMsgs []json.RawMessage
 			if err := json.Unmarshal(respReq.Input, &inputMsgs); err == nil {
+				// Process each input message with type awareness
+				var pendingReasoning string     // reasoning text to attach to next assistant message
+				var pendingToolCalls []ToolCall // accumulated function_call items
+
+				flushToolCalls := func() {
+					if len(pendingToolCalls) == 0 {
+						return
+					}
+					m := ChatMessage{
+						Role:      "assistant",
+						ToolCalls: pendingToolCalls,
+					}
+					if pendingReasoning != "" {
+						rc := pendingReasoning
+						m.ReasoningContent = &rc
+						pendingReasoning = ""
+					}
+					messages = append(messages, m)
+					pendingToolCalls = nil
+				}
+
 				for _, rawMsg := range inputMsgs {
 					var im ResponsesInputMessage
 					json.Unmarshal(rawMsg, &im)
 
 					switch {
+					case im.Type == "reasoning":
+						// Extract reasoning text from summary and hold for next assistant message
+						if im.Summary != nil {
+							var summary []ResponsesSummary
+							if json.Unmarshal(im.Summary, &summary) == nil {
+								var parts []string
+								for _, s := range summary {
+									if s.Text != "" {
+										parts = append(parts, s.Text)
+									}
+								}
+								if len(parts) > 0 {
+									if pendingReasoning != "" {
+										pendingReasoning += "\n" + strings.Join(parts, "\n")
+									} else {
+										pendingReasoning = strings.Join(parts, "\n")
+									}
+								}
+							}
+						}
+
 					case im.Type == "function_call_output":
+						flushToolCalls()
 						messages = append(messages, ChatMessage{
 							Role:       "tool",
 							Content:    jsonString(im.Output),
 							ToolCallID: im.CallID,
 						})
+
 					case im.Type == "function_call":
-						messages = append(messages, ChatMessage{
-							Role: "assistant",
-							ToolCalls: []ToolCall{{
-								ID:   im.CallID,
-								Type: "function",
-								Function: FunctionCall{
-									Name:      im.Name,
-									Arguments: im.Arguments,
-								},
-							}},
+						pendingToolCalls = append(pendingToolCalls, ToolCall{
+							ID:   im.CallID,
+							Type: "function",
+							Function: FunctionCall{
+								Name:      im.Name,
+								Arguments: im.Arguments,
+							},
 						})
+
 					default:
+						flushToolCalls()
 						role := im.Role
 						if role == "" {
 							role = "assistant"
+						}
+						if role == "developer" {
+							role = "system"
 						}
 						msg := ChatMessage{Role: role}
 						if im.Content != nil {
@@ -496,12 +543,20 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 								}
 							}
 						}
+						// Attach pending reasoning_content to the next assistant message
+						if pendingReasoning != "" && role == "assistant" {
+							rc := pendingReasoning
+							msg.ReasoningContent = &rc
+							pendingReasoning = ""
+						}
 						messages = append(messages, msg)
 					}
 				}
+				flushToolCalls()
 			}
 		}
 	}
+	messages = cleanupOrphanedToolCalls(messages)
 	chatReq.Messages = messages
 
 	// Parameter mapping
@@ -633,6 +688,16 @@ func ConvertChatRespToResponsesResp(chatResp *ChatCompletionsResponse) (*Respons
 		if choice.FinishReason != nil && *choice.FinishReason == "length" {
 			respResp.Status = "incomplete"
 			respResp.IncompleteDetails = &ResponsesIncompleteDetails{Reason: "max_output_tokens"}
+		}
+
+		// Add reasoning output item if present (e.g., DeepSeek reasoning_content)
+		if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+			respResp.Output = append(respResp.Output, OutputItem{
+				ID:      generateID("rs_"),
+				Type:    "reasoning",
+				Status:  "completed",
+				Summary: []ResponsesSummary{{Type: "summary_text", Text: *msg.ReasoningContent}},
+			})
 		}
 
 		text := contentToString(msg.Content)
@@ -1120,6 +1185,72 @@ func convertTextToResponseFormat(text json.RawMessage) interface{} {
 	default:
 		return map[string]interface{}{"type": tf.Format.Type}
 	}
+}
+
+// cleanupOrphanedToolCalls removes tool_calls from assistant messages that lack
+// matching tool result messages, and removes tool result messages that reference
+// tool_calls no longer present. This prevents upstream API 400 errors when
+// conversation history has been compacted and tool results were lost.
+func cleanupOrphanedToolCalls(messages []ChatMessage) []ChatMessage {
+	// Collect all tool_call_ids that have matching tool results.
+	toolResultIDs := make(map[string]bool)
+	for _, m := range messages {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			toolResultIDs[m.ToolCallID] = true
+		}
+	}
+
+	cleaned := make([]ChatMessage, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			cleaned = append(cleaned, m)
+			continue
+		}
+
+		// Keep only tool_calls that have a matching result.
+		var validCalls []ToolCall
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" && toolResultIDs[tc.ID] {
+				validCalls = append(validCalls, tc)
+			}
+		}
+
+		if len(validCalls) > 0 {
+			m.ToolCalls = validCalls
+			cleaned = append(cleaned, m)
+			continue
+		}
+
+		// All tool_calls are orphaned. Keep the message only if it has
+		// text content or reasoning content; otherwise drop it entirely.
+		hasContent := m.Content != nil && contentToString(m.Content) != ""
+		hasReasoning := m.ReasoningContent != nil && *m.ReasoningContent != ""
+
+		if hasContent || hasReasoning {
+			m.ToolCalls = nil
+			cleaned = append(cleaned, m)
+		}
+	}
+
+	// Reverse pass: remove tool result messages whose tool_call_id is no
+	// longer referenced by any remaining assistant message's tool_calls.
+	validIDs := make(map[string]bool)
+	for _, m := range cleaned {
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" {
+				validIDs[tc.ID] = true
+			}
+		}
+	}
+	var final []ChatMessage
+	for _, m := range cleaned {
+		if m.Role == "tool" && m.ToolCallID != "" && !validIDs[m.ToolCallID] {
+			continue // drop orphaned tool result
+		}
+		final = append(final, m)
+	}
+
+	return final
 }
 
 // ==================== Helpers ====================

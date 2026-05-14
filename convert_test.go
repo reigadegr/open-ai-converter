@@ -822,7 +822,7 @@ func TestConvertResponsesRespToChatResp_ReasoningOutput(t *testing.T) {
 	}
 
 	msg := chatResp.Choices[0].Message
-	if msg.ReasoningContent != "I thought about this." {
+	if msg.ReasoningContent == nil || *msg.ReasoningContent != "I thought about this." {
 		t.Errorf("reasoning_content = %v, want 'I thought about this.'", msg.ReasoningContent)
 	}
 
@@ -1019,5 +1019,286 @@ func TestFinalizeResponsesChatStream(t *testing.T) {
 	chunks2 := FinalizeResponsesChatStream(state)
 	if chunks2 != nil {
 		t.Errorf("second finalize should return nil, got %d chunks", len(chunks2))
+	}
+}
+
+// ==================== Reasoning Input Tests ====================
+
+func TestConvertResponsesToChat_ReasoningInput(t *testing.T) {
+	inputJSON := `[
+		{"type":"reasoning","id":"r_1","summary":[{"type":"summary_text","text":"I considered the problem carefully."}]},
+		{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"The answer is 42."}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// Should have one assistant message
+	if len(chatReq.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(chatReq.Messages))
+	}
+
+	msg := chatReq.Messages[0]
+	if msg.Role != "assistant" {
+		t.Errorf("role = %v, want assistant", msg.Role)
+	}
+
+	// ReasoningContent should contain the summary text
+	if msg.ReasoningContent == nil {
+		t.Fatal("reasoning_content is nil, want 'I considered the problem carefully.'")
+	}
+	if *msg.ReasoningContent != "I considered the problem carefully." {
+		t.Errorf("reasoning_content = %v, want 'I considered the problem carefully.'", *msg.ReasoningContent)
+	}
+
+	// Content should be the output_text
+	text := contentToString(msg.Content)
+	if text != "The answer is 42." {
+		t.Errorf("content = %v, want 'The answer is 42.'", text)
+	}
+}
+
+func TestConvertResponsesToChat_ReasoningThenToolCall(t *testing.T) {
+	inputJSON := `[
+		{"type":"reasoning","id":"r_1","summary":[{"type":"summary_text","text":"I need to check the weather."}]},
+		{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather","arguments":"{\"city\":\"Beijing\"}","status":"completed"},
+		{"type":"function_call_output","call_id":"call_abc","output":"Sunny, 25°C"}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// Should have 2 messages: assistant (with tool_calls + reasoning) + tool result
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(chatReq.Messages))
+	}
+
+	// First: assistant with both reasoning and tool_calls
+	assistantMsg := chatReq.Messages[0]
+	if assistantMsg.Role != "assistant" {
+		t.Errorf("msg[0] role = %v, want assistant", assistantMsg.Role)
+	}
+
+	if len(assistantMsg.ToolCalls) != 1 {
+		t.Fatalf("msg[0] tool_calls count = %d, want 1", len(assistantMsg.ToolCalls))
+	}
+	if assistantMsg.ToolCalls[0].Function.Name != "get_weather" {
+		t.Errorf("tool_call name = %v, want get_weather", assistantMsg.ToolCalls[0].Function.Name)
+	}
+	if assistantMsg.ToolCalls[0].ID != "call_abc" {
+		t.Errorf("tool_call id = %v, want call_abc", assistantMsg.ToolCalls[0].ID)
+	}
+
+	if assistantMsg.ReasoningContent == nil {
+		t.Fatal("msg[0] reasoning_content is nil, want 'I need to check the weather.'")
+	}
+	if *assistantMsg.ReasoningContent != "I need to check the weather." {
+		t.Errorf("reasoning_content = %v, want 'I need to check the weather.'", *assistantMsg.ReasoningContent)
+	}
+
+	// Second: tool result
+	toolMsg := chatReq.Messages[1]
+	if toolMsg.Role != "tool" {
+		t.Errorf("msg[1] role = %v, want tool", toolMsg.Role)
+	}
+	if toolMsg.ToolCallID != "call_abc" {
+		t.Errorf("msg[1] tool_call_id = %v, want call_abc", toolMsg.ToolCallID)
+	}
+}
+
+// ==================== cleanupOrphanedToolCalls Tests ====================
+
+func TestCleanupOrphanedToolCalls(t *testing.T) {
+	t.Run("matched tool result: keep both", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:    "assistant",
+				Content: json.RawMessage("null"),
+				ToolCalls: []ToolCall{
+					{ID: "call_1", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+			{Role: "tool", ToolCallID: "call_1", Content: jsonString("result 1")},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(result))
+		}
+		if len(result[0].ToolCalls) != 1 {
+			t.Errorf("expected 1 tool_call, got %d", len(result[0].ToolCalls))
+		}
+	})
+
+	t.Run("orphaned tool_call with content: keep message, remove tool_calls", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:    "assistant",
+				Content: jsonString("I changed my mind."),
+				ToolCalls: []ToolCall{
+					{ID: "call_orphan", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(result))
+		}
+		if len(result[0].ToolCalls) != 0 {
+			t.Errorf("tool_calls should be removed, got %d", len(result[0].ToolCalls))
+		}
+		if contentToString(result[0].Content) != "I changed my mind." {
+			t.Errorf("content should be preserved")
+		}
+	})
+
+	t.Run("orphaned tool_call with reasoning_content: keep message, remove tool_calls", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:             "assistant",
+				Content:          json.RawMessage("null"),
+				ReasoningContent: strPtr("Let me think..."),
+				ToolCalls: []ToolCall{
+					{ID: "call_orphan", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(result))
+		}
+		if len(result[0].ToolCalls) != 0 {
+			t.Errorf("tool_calls should be removed, got %d", len(result[0].ToolCalls))
+		}
+		if result[0].ReasoningContent == nil || *result[0].ReasoningContent != "Let me think..." {
+			t.Errorf("reasoning_content should be preserved")
+		}
+	})
+
+	t.Run("orphaned tool_call with no content or reasoning: delete message", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:    "assistant",
+				Content: json.RawMessage("null"),
+				ToolCalls: []ToolCall{
+					{ID: "call_orphan", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 0 {
+			t.Fatalf("expected 0 messages, got %d", len(result))
+		}
+	})
+
+	t.Run("orphaned tool result: delete", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:    "assistant",
+				Content: json.RawMessage("null"),
+				ToolCalls: []ToolCall{
+					{ID: "call_1", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+			{Role: "tool", ToolCallID: "call_1", Content: jsonString("result 1")},
+			{Role: "tool", ToolCallID: "call_orphan", Content: jsonString("stale result")},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(result))
+		}
+		// The orphaned tool result should be gone
+		for _, m := range result {
+			if m.Role == "tool" && m.ToolCallID == "call_orphan" {
+				t.Error("orphaned tool result should have been removed")
+			}
+		}
+	})
+}
+
+// ==================== Developer Role Test ====================
+
+func TestConvertResponsesToChat_DeveloperRole(t *testing.T) {
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"developer","status":"completed","content":[{"type":"input_text","text":"Be concise."}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	if len(chatReq.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(chatReq.Messages))
+	}
+
+	msg := chatReq.Messages[0]
+	if msg.Role != "system" {
+		t.Errorf("role = %v, want system (developer should be converted to system)", msg.Role)
+	}
+
+	text := contentToString(msg.Content)
+	if text != "Be concise." {
+		t.Errorf("content = %v, want 'Be concise.'", text)
+	}
+}
+
+// ==================== ReasoningNil Response Test ====================
+
+func TestConvertChatRespToResponsesResp_ReasoningNil(t *testing.T) {
+	chatResp := &ChatCompletionsResponse{
+		ID:      "chatcmpl-nil-reasoning",
+		Object:  "chat.completion",
+		Created: 1000,
+		Model:   "gpt-4o",
+		Choices: []ChatChoice{
+			{
+				Index: 0,
+				Message: &ChatMessage{
+					Role:             "assistant",
+					Content:          jsonString("Hello!"),
+					ReasoningContent: nil,
+				},
+				FinishReason: strPtr("stop"),
+			},
+		},
+	}
+
+	respResp, err := ConvertChatRespToResponsesResp(chatResp)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// Should not contain any reasoning output items
+	for _, item := range respResp.Output {
+		if item.Type == "reasoning" {
+			t.Errorf("should not have reasoning output item when ReasoningContent is nil")
+		}
+	}
+
+	// Should have exactly 1 message output item
+	if len(respResp.Output) != 1 {
+		t.Fatalf("expected 1 output item, got %d", len(respResp.Output))
+	}
+	if respResp.Output[0].Type != "message" {
+		t.Errorf("output[0] type = %v, want message", respResp.Output[0].Type)
 	}
 }
