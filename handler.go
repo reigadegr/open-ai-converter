@@ -176,6 +176,10 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
+	// Two-pass SSE deserialization: first extract type, then use lightweight structs
+	// for high-frequency events to avoid deserializing heavy nested fields.
+	var typeBuf struct{ Type string `json:"type"` }
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -186,8 +190,130 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			continue
 		}
 
+		raw := []byte(data)
+
+		// Pass 1: extract event type only
+		typeBuf.Type = ""
+		if err := json.Unmarshal(raw, &typeBuf); err != nil {
+			continue
+		}
+
+		// Pass 2: deserialize to lightweight struct based on event type
 		var evt ResponsesStreamEvent
-		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+		switch typeBuf.Type {
+
+		// High-frequency delta events — use minimal structs
+		case "response.output_text.delta":
+			var td responsesTextDeltaEvent
+			if json.Unmarshal(raw, &td) == nil {
+				evt.Type = td.Type
+				evt.Delta = td.Delta
+				evt.OutputIndex = td.OutputIndex
+				evt.ContentIndex = td.ContentIndex
+				evt.ItemID = td.ItemID
+			}
+		case "response.content_part.delta":
+			var td responsesTextDeltaEvent
+			if json.Unmarshal(raw, &td) == nil {
+				evt.Type = td.Type
+				evt.Delta = td.Delta
+				evt.OutputIndex = td.OutputIndex
+				evt.ContentIndex = td.ContentIndex
+				evt.ItemID = td.ItemID
+			}
+		case "response.refusal.delta":
+			var td responsesTextDeltaEvent
+			if json.Unmarshal(raw, &td) == nil {
+				evt.Type = td.Type
+				evt.Delta = td.Delta
+				evt.OutputIndex = td.OutputIndex
+				evt.ContentIndex = td.ContentIndex
+				evt.ItemID = td.ItemID
+			}
+		case "response.function_call_arguments.delta":
+			var fd responsesFuncArgsDeltaEvent
+			if json.Unmarshal(raw, &fd) == nil {
+				evt.Type = fd.Type
+				evt.Delta = fd.Delta
+				evt.OutputIndex = fd.OutputIndex
+				evt.ItemID = fd.ItemID
+			}
+		case "response.reasoning_summary_text.delta":
+			var rd responsesReasoningDeltaEvent
+			if json.Unmarshal(raw, &rd) == nil {
+				evt.Type = rd.Type
+				evt.Delta = rd.Delta
+				evt.OutputIndex = rd.OutputIndex
+				evt.ContentIndex = rd.ContentIndex
+				evt.ItemID = rd.ItemID
+			}
+
+		// output_item.added — use lightweight item (no Content/Summary/Action arrays)
+		case "response.output_item.added":
+			var oa responsesOutputItemAddedEvent
+			if json.Unmarshal(raw, &oa) == nil {
+				evt.Type = oa.Type
+				evt.OutputIndex = oa.OutputIndex
+				if oa.Item != nil {
+					evt.Item = &OutputItem{
+						ID:     oa.Item.ID,
+						Type:   oa.Item.Type,
+						Status: oa.Item.Status,
+						Name:   oa.Item.Name,
+						CallID: oa.Item.CallID,
+					}
+				}
+			}
+
+		// Terminal events — use lightweight struct (no Output []OutputItem)
+		case "response.completed", "response.done",
+			"response.incomplete", "response.failed":
+			var ce responsesCompletedEvent
+			if json.Unmarshal(raw, &ce) == nil {
+				evt.Type = ce.Type
+				if ce.Response != nil {
+					resp := &ResponsesResponse{
+						ID:                ce.Response.ID,
+						Model:             ce.Response.Model,
+						Status:            ce.Response.Status,
+						IncompleteDetails: ce.Response.IncompleteDetails,
+					}
+					if ce.Response.Usage != nil {
+						u := ce.Response.Usage
+						resp.Usage = &ResponsesUsage{
+							InputTokens:         u.InputTokens,
+							OutputTokens:        u.OutputTokens,
+							TotalTokens:         u.TotalTokens,
+							InputTokensDetails:  u.InputTokensDetails,
+							OutputTokensDetails: u.OutputTokensDetails,
+						}
+					}
+					evt.Response = resp
+				}
+			}
+
+		// response.created — only needs ID and Model from Response
+		case "response.created":
+			var cr struct {
+				Type     string `json:"type"`
+				Response struct {
+					ID    string `json:"id"`
+					Model string `json:"model"`
+				} `json:"response"`
+			}
+			if json.Unmarshal(raw, &cr) == nil {
+				evt.Type = cr.Type
+				if cr.Response.ID != "" || cr.Response.Model != "" {
+					evt.Response = &ResponsesResponse{
+						ID:    cr.Response.ID,
+						Model: cr.Response.Model,
+					}
+				}
+			}
+
+		default:
+			// Unknown event type — skip full deserialization entirely.
+			// ResponsesEventToChatChunks returns nil for unknown types anyway.
 			continue
 		}
 
@@ -633,8 +759,12 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					flusher.Flush()
 					seqNum++
 				} else {
+					callID := tc.ID
+					if callID == "" {
+						callID = generateID("call_")
+					}
 					newTC := &ToolCall{
-						ID:   tc.ID,
+						ID:   callID,
 						Type: "function",
 						Function: FunctionCall{
 							Name:      tc.Function.Name,
@@ -647,8 +777,8 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
 						"type": "response.output_item.added", "output_index": outputIndex + idx + 1,
 						"item": map[string]interface{}{
-							"id": tc.ID, "type": "function_call", "status": "in_progress",
-							"call_id": tc.ID, "name": tc.Function.Name, "arguments": "",
+							"id": callID, "type": "function_call", "status": "in_progress",
+							"call_id": callID, "name": tc.Function.Name, "arguments": "",
 						},
 						"sequence_number": seqNum,
 					})
@@ -658,7 +788,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					if tc.Function.Arguments != "" {
 						writeResponsesSSE(w, "response.function_call_arguments.delta", map[string]interface{}{
 							"type":    "response.function_call_arguments.delta",
-							"item_id": tc.ID, "output_index": outputIndex + idx + 1,
+							"item_id": callID, "output_index": outputIndex + idx + 1,
 							"delta": tc.Function.Arguments, "sequence_number": seqNum,
 						})
 						flusher.Flush()
@@ -877,9 +1007,15 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	}
 
 	completedResponse := map[string]interface{}{
-		"id": responseID, "object": "response", "created_at": created,
-		"status": finalStatus, "completed_at": time.Now().Unix(),
-		"model": model, "output": outputItems, "usage": usage,
+		"id":         responseID,
+		"object":     "response",
+		"created_at": created,
+		"status":     finalStatus,
+		"completed_at": time.Now().Unix(),
+		"model":      model,
+		"output":     outputItems,
+		"output_text": displayText,
+		"usage":      usage,
 	}
 	writeResponsesSSE(w, "response.completed", map[string]interface{}{
 		"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,

@@ -830,6 +830,10 @@ func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEvent
 		return resToChatHandleCreated(evt, state)
 	case "response.output_text.delta":
 		return resToChatHandleTextDelta(evt, state)
+	case "response.content_part.delta":
+		return resToChatHandleTextDelta(evt, state)
+	case "response.refusal.delta":
+		return resToChatHandleRefusalDelta(evt, state)
 	case "response.output_item.added":
 		return resToChatHandleOutputItemAdded(evt, state)
 	case "response.function_call_arguments.delta":
@@ -897,6 +901,14 @@ func resToChatHandleTextDelta(evt *ResponsesStreamEvent, state *ResponsesEventTo
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Content: &content})}
 }
 
+func resToChatHandleRefusalDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Delta == "" {
+		return nil
+	}
+	refusal := evt.Delta
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Refusal: &refusal})}
+}
+
 func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
 	if evt.Item == nil || evt.Item.Type != "function_call" {
 		return nil
@@ -906,10 +918,18 @@ func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesE
 	state.OutputIndexToToolIndex[evt.OutputIndex] = idx
 	state.NextToolCallIndex++
 
+	callID := evt.Item.CallID
+	if callID == "" {
+		callID = evt.ItemID
+	}
+	if callID == "" {
+		callID = generateID("call_")
+	}
+
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ToolCall{{
 			Index: &idx,
-			ID:    evt.Item.CallID,
+			ID:    callID,
 			Type:  "function",
 			Function: FunctionCall{Name: evt.Item.Name},
 		}},
@@ -954,6 +974,11 @@ func resToChatHandleCompleted(evt *ResponsesStreamEvent, state *ResponsesEventTo
 			}
 			if u.InputTokensDetails != nil && u.InputTokensDetails.CachedTokens > 0 {
 				usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: u.InputTokensDetails.CachedTokens}
+			}
+			if u.OutputTokensDetails != nil && u.OutputTokensDetails.ReasoningTokens > 0 {
+				usage.CompletionTokensDetails = &CompletionTokensDetails{
+					ReasoningTokens: u.OutputTokensDetails.ReasoningTokens,
+				}
 			}
 			state.Usage = usage
 		}
