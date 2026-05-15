@@ -12,39 +12,38 @@ import (
 // ==================== Chat Completions → Responses API ====================
 
 func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesRequest, error) {
-	input, instructions, err := convertChatMessagesToResponsesInput(chatReq.Messages)
-	if err != nil {
-		return nil, err
-	}
-
-	inputJSON, err := json.Marshal(input)
-	if err != nil {
-		return nil, err
-	}
-
 	out := &ResponsesRequest{
-		Model:        chatReq.Model,
-		Input:        inputJSON,
-		Temperature:  chatReq.Temperature,
-		TopP:         chatReq.TopP,
-		Stream:       chatReq.Stream,
-		ServiceTier:  chatReq.ServiceTier,
+		Model:            chatReq.Model,
+		Stream:           chatReq.Stream,
+		Temperature:      chatReq.Temperature,
+		TopP:             chatReq.TopP,
+		FrequencyPenalty: chatReq.FrequencyPenalty,
+		PresencePenalty:  chatReq.PresencePenalty,
+		Stop:             chatReq.Stop,
+		Seed:             chatReq.Seed,
+		Store:            chatReq.Store,
+		Metadata:         chatReq.Metadata,
+		ServiceTier:      chatReq.ServiceTier,
+		ParallelToolCalls: chatReq.ParallelToolCalls,
+		User:             chatReq.User,
+		ToolChoice:       chatReq.ToolChoice,
 	}
 
+	// 1. Convert messages → input and instructions
+	inputMsgs, instructions, err := convertChatMessagesToResponsesInput(chatReq.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("convert messages: %w", err)
+	}
+	inputJSON, err := json.Marshal(inputMsgs)
+	if err != nil {
+		return nil, err
+	}
+	out.Input = inputJSON
 	if instructions != "" {
 		out.Instructions = &instructions
 	}
 
-	// Set defaults for upstream streaming
-	if chatReq.Stream {
-		out.Include = []string{"reasoning.encrypted_content"}
-		storeFalse := false
-		out.Store = &storeFalse
-	}
-
-	// Extract instructions from system/developer messages
-	// (already handled inside convertChatMessagesToResponsesInput)
-
+	// 2. max_tokens / max_completion_tokens → max_output_tokens (with floor)
 	if chatReq.MaxCompletionTokens != nil {
 		v := *chatReq.MaxCompletionTokens
 		if v < minMaxOutputTokens {
@@ -63,38 +62,15 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesR
 		log.Printf("[chat->resp] WARNING: n=%d requested but Responses API only supports 1 output", *chatReq.N)
 	}
 
-	if chatReq.FrequencyPenalty != nil {
-		out.FrequencyPenalty = chatReq.FrequencyPenalty
-	}
-	if chatReq.PresencePenalty != nil {
-		out.PresencePenalty = chatReq.PresencePenalty
-	}
-	if chatReq.Stop != nil {
-		out.Stop = chatReq.Stop
-	}
-	if chatReq.Seed != nil {
-		out.Seed = chatReq.Seed
-	}
-	if chatReq.Store != nil {
-		out.Store = chatReq.Store
-	}
-	if chatReq.Metadata != nil {
-		out.Metadata = chatReq.Metadata
-	}
+	// 3. logprobs → top_logprobs
 	if chatReq.TopLogprobs != nil {
 		out.TopLogprobs = chatReq.TopLogprobs
 	} else if chatReq.Logprobs != nil && *chatReq.Logprobs {
 		v := 1
 		out.TopLogprobs = &v
 	}
-	if chatReq.ParallelToolCalls != nil {
-		out.ParallelToolCalls = chatReq.ParallelToolCalls
-	}
-	if chatReq.User != nil {
-		out.User = chatReq.User
-	}
 
-	// reasoning_effort → reasoning.effort + summary="auto"
+	// 4. reasoning_effort → reasoning
 	if chatReq.ReasoningEffort != nil {
 		out.Reasoning = &ResponsesReasoning{
 			Effort:  *chatReq.ReasoningEffort,
@@ -102,25 +78,25 @@ func ConvertChatToResponsesRequest(chatReq *ChatCompletionsRequest) (*ResponsesR
 		}
 	}
 
-	// response_format → text.format
+	// 5. response_format → text.format
 	if chatReq.ResponseFormat != nil {
 		if text := convertResponseFormatToText(chatReq.ResponseFormat); text != nil {
 			out.Text = json.RawMessage(mustMarshal(text))
 		}
 	}
 
-	// tools
+	// 6. tools
 	if len(chatReq.Tools) > 0 {
 		out.Tools = json.RawMessage(mustMarshal(convertChatToolsToResponses(chatReq.Tools)))
 	}
 
-	// tool_choice
-	if chatReq.ToolChoice != nil {
-		out.ToolChoice = chatReq.ToolChoice
-	}
-
-	// stream_options
+	// 7. stream-specific fields
 	if chatReq.Stream {
+		out.Include = []string{"reasoning.encrypted_content"}
+		if out.Store == nil {
+			storeFalse := false
+			out.Store = &storeFalse
+		}
 		if chatReq.StreamOptions != nil {
 			out.StreamOptions = &StreamOptions{IncludeUsage: chatReq.StreamOptions.IncludeUsage}
 		} else {

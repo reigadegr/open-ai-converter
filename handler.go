@@ -347,6 +347,46 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[resp→chat] model=%s stream=%v", respReq.Model, respReq.Stream)
 
+	// Guard: skip empty input — some upstreams hang on empty user messages
+	if respReq.Input == nil || isEmptyInput(respReq.Input) {
+		log.Printf("[resp→chat] skip empty-input request (stream=%v)", respReq.Stream)
+		responseID := generateID("resp_")
+		created := nowUnix()
+		baseResponse := map[string]interface{}{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": created,
+			"status":     "completed",
+			"model":      respReq.Model,
+			"output":     []interface{}{},
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+				"total_tokens":  0,
+			},
+		}
+		if respReq.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+			writeResponsesSSE(w, "response.created", map[string]interface{}{
+				"type": "response.created", "response": baseResponse, "sequence_number": 0,
+			})
+			writeResponsesSSE(w, "response.completed", map[string]interface{}{
+				"type": "response.completed", "response": baseResponse, "sequence_number": 1,
+			})
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(baseResponse)
+		}
+		return
+	}
+
 	chatReq, err := ConvertResponsesToChatRequest(&respReq)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversion error: "+err.Error())
@@ -414,8 +454,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			log.Printf("[resp→chat] stream panic: %v", rec)
 			if sseStarted {
 				if flusher, ok := w.(http.Flusher); ok {
-					writeSSEError(w, http.StatusInternalServerError, fmt.Sprintf("%v", rec))
-					flusher.Flush()
+					writeSSEError(w, flusher, http.StatusInternalServerError, fmt.Sprintf("%v", rec))
 				}
 			} else {
 				writeError(w, http.StatusInternalServerError, fmt.Sprintf("stream panic: %v", rec))
@@ -811,8 +850,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		writeResponsesSSE(w, "response.completed", map[string]interface{}{
 			"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
 		})
-		writeSSEError(w, http.StatusInternalServerError, fmt.Sprintf("upstream stream error: %v", err))
-		flusher.Flush()
+		writeSSEError(w, flusher, http.StatusInternalServerError, fmt.Sprintf("upstream stream error: %v", err))
 		return
 	}
 
@@ -1190,7 +1228,7 @@ func writeResponsesSSE(w http.ResponseWriter, event string, data interface{}) {
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 }
 
-func writeSSEError(w http.ResponseWriter, code int, msg string) {
+func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code int, msg string) {
 	errEvent := map[string]interface{}{
 		"type": "error",
 		"error": map[string]interface{}{
@@ -1200,6 +1238,7 @@ func writeSSEError(w http.ResponseWriter, code int, msg string) {
 	}
 	b, _ := json.Marshal(errEvent)
 	fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
+	flusher.Flush()
 }
 
 func truncateLog(s string, maxLen int) string {
@@ -1207,4 +1246,33 @@ func truncateLog(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// isEmptyInput checks if the input field is empty (string "", empty array [], or null).
+// Uses byte inspection to avoid json.Unmarshal allocations on every request.
+func isEmptyInput(input json.RawMessage) bool {
+	// Trim leading/trailing whitespace via byte scan.
+	i, j := 0, len(input)-1
+	for i <= j && (input[i] == ' ' || input[i] == '\t' || input[i] == '\n' || input[i] == '\r') {
+		i++
+	}
+	for j >= i && (input[j] == ' ' || input[j] == '\t' || input[j] == '\n' || input[j] == '\r') {
+		j--
+	}
+	if i > j {
+		return true // empty or whitespace-only
+	}
+	// Empty string: exactly '""'
+	if input[i] == '"' && j == i+1 && input[j] == '"' {
+		return true
+	}
+	// Empty array: exactly '[]'
+	if input[i] == '[' && j == i+1 && input[j] == ']' {
+		return true
+	}
+	// JSON null literal: exactly 'null'
+	if j-i == 3 && input[i] == 'n' && input[i+1] == 'u' && input[i+2] == 'l' && input[i+3] == 'l' {
+		return true
+	}
+	return false
 }
