@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -352,18 +353,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[resp→chat] skip empty-input request (stream=%v)", respReq.Stream)
 		responseID := generateID("resp_")
 		created := nowUnix()
-		baseResponse := map[string]interface{}{
-			"id":         responseID,
-			"object":     "response",
-			"created_at": created,
-			"status":     "completed",
-			"model":      respReq.Model,
-			"output":     []interface{}{},
-			"usage": map[string]interface{}{
-				"input_tokens":  0,
-				"output_tokens": 0,
-				"total_tokens":  0,
-			},
+		baseResponse := buildBaseResponse(&respReq, responseID, created, "completed")
+		baseResponse["usage"] = map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+			"total_tokens":  0,
 		}
 		if respReq.Stream {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -374,8 +368,11 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			writeResponsesSSE(w, "response.created", map[string]interface{}{
 				"type": "response.created", "response": baseResponse, "sequence_number": 0,
 			})
+			writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
+				"type": "response.in_progress", "response": baseResponse, "sequence_number": 1,
+			})
 			writeResponsesSSE(w, "response.completed", map[string]interface{}{
-				"type": "response.completed", "response": baseResponse, "sequence_number": 1,
+				"type": "response.completed", "response": baseResponse, "sequence_number": 2,
 			})
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -404,7 +401,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := cfg.CompletionsAPIBaseURL + "/v1/chat/completions"
 
 	if respReq.Stream {
-		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, respReq.Model)
+		handleResponsesStreamViaChat(r, w, upstreamURL, apiKey, chatBody, &respReq)
 	} else {
 		handleResponsesNonStream(r, w, upstreamURL, apiKey, chatBody)
 	}
@@ -447,7 +444,183 @@ func handleResponsesNonStream(r *http.Request, w http.ResponseWriter, url, apiKe
 	json.NewEncoder(w).Encode(responsesResp)
 }
 
-func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, model string) {
+// float64ToInt converts a float64 to int if it is an integer value, otherwise returns the float64.
+func float64ToInt(f float64) interface{} {
+	if f == float64(int(f)) {
+		return int(f)
+	}
+	return f
+}
+
+// buildBaseResponse constructs a complete Responses API response object with all standard fields,
+// using sensible defaults and copying request parameters.
+func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int64, status string) map[string]interface{} {
+	base := map[string]interface{}{
+		"id":         responseID,
+		"object":     "response",
+		"created_at": created,
+		"status":     status,
+		"background": false,
+		"model":      respReq.Model,
+		"output":     []interface{}{},
+	}
+
+	// Null/optional fields
+	base["completed_at"] = nil
+	base["error"] = nil
+	base["incomplete_details"] = nil
+	base["max_tool_calls"] = nil
+	base["moderation"] = nil
+	base["usage"] = nil
+	base["top_logprobs"] = 0
+
+	// Generated fields
+	cacheKeyHash := sha256.Sum256([]byte(responseID))
+	base["prompt_cache_key"] = fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		cacheKeyHash[0:4], cacheKeyHash[4:6], cacheKeyHash[6:8], cacheKeyHash[8:10], cacheKeyHash[10:16])
+	base["prompt_cache_retention"] = "24h"
+	safetyHash := sha256.Sum256([]byte(responseID + ":safety"))
+	base["safety_identifier"] = "user-" + fmt.Sprintf("%x", safetyHash[:12])
+	base["truncation"] = "disabled"
+
+	// tool_usage placeholder
+	base["tool_usage"] = map[string]interface{}{
+		"image_gen": map[string]interface{}{
+			"input_tokens": 0,
+			"input_tokens_details": map[string]interface{}{
+				"image_tokens": 0,
+				"text_tokens":  0,
+			},
+			"output_tokens": 0,
+			"output_tokens_details": map[string]interface{}{
+				"image_tokens": 0,
+				"text_tokens":  0,
+			},
+			"total_tokens": 0,
+		},
+		"web_search": map[string]interface{}{
+			"num_requests": 0,
+		},
+	}
+
+	// Default values
+	base["frequency_penalty"] = 0
+	base["max_output_tokens"] = nil
+	base["presence_penalty"] = 0
+	base["previous_response_id"] = nil
+	if status == "completed" {
+		base["service_tier"] = "default"
+	} else {
+		base["service_tier"] = "auto"
+	}
+	base["temperature"] = 1
+	base["top_p"] = 0.98
+	base["user"] = nil
+	base["metadata"] = map[string]interface{}{}
+
+	// Copy fields from request (override defaults if provided)
+	if respReq.Instructions != nil {
+		base["instructions"] = *respReq.Instructions
+	}
+	if respReq.Temperature != nil {
+		base["temperature"] = float64ToInt(*respReq.Temperature)
+	}
+	if respReq.TopP != nil {
+		base["top_p"] = *respReq.TopP
+	}
+	if respReq.MaxOutputTokens != nil {
+		base["max_output_tokens"] = *respReq.MaxOutputTokens
+	}
+	if respReq.FrequencyPenalty != nil {
+		base["frequency_penalty"] = float64ToInt(*respReq.FrequencyPenalty)
+	}
+	if respReq.PresencePenalty != nil {
+		base["presence_penalty"] = float64ToInt(*respReq.PresencePenalty)
+	}
+	if respReq.ParallelToolCalls != nil {
+		base["parallel_tool_calls"] = *respReq.ParallelToolCalls
+	}
+	if respReq.Store != nil {
+		base["store"] = *respReq.Store
+	}
+	if respReq.ServiceTier != nil {
+		base["service_tier"] = *respReq.ServiceTier
+	}
+	if respReq.PreviousResponseID != nil {
+		base["previous_response_id"] = *respReq.PreviousResponseID
+	}
+	if respReq.User != nil {
+		base["user"] = *respReq.User
+	}
+	if respReq.TopLogprobs != nil {
+		base["top_logprobs"] = *respReq.TopLogprobs
+	}
+
+	// Reasoning
+	if respReq.Reasoning != nil {
+		v := map[string]interface{}{
+			"effort": respReq.Reasoning.Effort,
+		}
+		if respReq.Reasoning.Summary != "" {
+			v["summary"] = respReq.Reasoning.Summary
+		} else {
+			v["summary"] = nil
+		}
+		base["reasoning"] = v
+	}
+
+	// Text
+	if respReq.Text != nil {
+		var v map[string]interface{}
+		if json.Unmarshal(respReq.Text, &v) == nil {
+			if _, hasFormat := v["format"]; !hasFormat {
+				v["format"] = map[string]interface{}{"type": "text"}
+			}
+			base["text"] = v
+		}
+	}
+
+	// ToolChoice
+	if respReq.ToolChoice != nil {
+		var v interface{}
+		if json.Unmarshal(respReq.ToolChoice, &v) == nil {
+			base["tool_choice"] = v
+		}
+	}
+
+	// Tools: ensure function-type tools have "type":"function"
+	if respReq.Tools != nil {
+		var tools []map[string]interface{}
+		if json.Unmarshal(respReq.Tools, &tools) == nil {
+			for _, t := range tools {
+				if _, hasType := t["type"]; !hasType {
+					t["type"] = "function"
+				}
+			}
+			base["tools"] = tools
+		}
+	}
+
+	// Metadata
+	if respReq.Metadata != nil {
+		var v interface{}
+		if json.Unmarshal(respReq.Metadata, &v) == nil {
+			base["metadata"] = v
+		}
+	}
+
+	// Truncation
+	if respReq.Truncation != nil {
+		var v interface{}
+		if json.Unmarshal(respReq.Truncation, &v) == nil {
+			base["truncation"] = v
+		}
+	}
+
+	return base
+}
+
+func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, respReq *ResponsesRequest) {
 	var sseStarted bool
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -500,10 +673,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 				seqNum := 0
 				responseID := generateID("resp_")
-				baseResponse := map[string]interface{}{
-					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
-					"status": responsesResp.Status, "model": model, "output": []interface{}{},
-				}
+				baseResponse := buildBaseResponse(respReq, responseID, responsesResp.CreatedAt, responsesResp.Status)
 				writeResponsesSSE(w, "response.created", map[string]interface{}{
 					"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
 				})
@@ -520,11 +690,9 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					outputItems = append(outputItems, item)
 				}
 
-				completedResponse := map[string]interface{}{
-					"id": responseID, "object": "response", "created_at": responsesResp.CreatedAt,
-					"status": responsesResp.Status, "completed_at": time.Now().Unix(),
-					"model": model, "output": outputItems,
-				}
+				completedResponse := buildBaseResponse(respReq, responseID, responsesResp.CreatedAt, responsesResp.Status)
+				completedResponse["completed_at"] = time.Now().Unix()
+				completedResponse["output"] = outputItems
 				if responsesResp.Usage != nil {
 					completedResponse["usage"] = map[string]interface{}{
 						"input_tokens":  responsesResp.Usage.InputTokens,
@@ -553,14 +721,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	created := nowUnix()
 	seqNum := 0
 
-	baseResponse := map[string]interface{}{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": created,
-		"status":     "in_progress",
-		"model":      model,
-		"output":     []interface{}{},
-	}
+	baseResponse := buildBaseResponse(respReq, responseID, created, "in_progress")
 
 	// response.created
 	writeResponsesSSE(w, "response.created", map[string]interface{}{
@@ -841,12 +1002,10 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 
 	if err := scanner.Err(); err != nil {
 		log.Printf("[resp→chat] stream read error: %v", err)
-		completedResponse := map[string]interface{}{
-			"id": responseID, "object": "response", "created_at": created,
-			"status": "failed", "completed_at": time.Now().Unix(),
-			"model": model, "output": []interface{}{},
-			"incomplete_details": map[string]interface{}{"reason": "upstream_stream_error"},
-		}
+		completedResponse := buildBaseResponse(respReq, responseID, created, "failed")
+		completedAt := time.Now().Unix()
+		completedResponse["completed_at"] = completedAt
+		completedResponse["incomplete_details"] = map[string]interface{}{"reason": "upstream_stream_error"}
 		writeResponsesSSE(w, "response.completed", map[string]interface{}{
 			"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
 		})
@@ -1061,17 +1220,11 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		usage = u
 	}
 
-	completedResponse := map[string]interface{}{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": created,
-		"status":     finalStatus,
-		"completed_at": time.Now().Unix(),
-		"model":      model,
-		"output":     outputItems,
-		"output_text": displayText,
-		"usage":      usage,
-	}
+	completedResponse := buildBaseResponse(respReq, responseID, created, finalStatus)
+	completedResponse["completed_at"] = time.Now().Unix()
+	completedResponse["output"] = outputItems
+	completedResponse["output_text"] = displayText
+	completedResponse["usage"] = usage
 	writeResponsesSSE(w, "response.completed", map[string]interface{}{
 		"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
 	})

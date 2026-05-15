@@ -209,6 +209,22 @@ type ResponsesResponse struct {
 	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
 	Reasoning         json.RawMessage `json:"reasoning,omitempty"`
 	Text              json.RawMessage `json:"text,omitempty"`
+	// Fields matching standard Responses API spec
+	Background           *bool          `json:"background,omitempty"`
+	CompletedAt          *int64         `json:"completed_at,omitempty"`
+	FrequencyPenalty     *float64       `json:"frequency_penalty,omitempty"`
+	MaxToolCalls         *int           `json:"max_tool_calls,omitempty"`
+	Moderation           json.RawMessage `json:"moderation,omitempty"`
+	ParallelToolCalls    *bool          `json:"parallel_tool_calls,omitempty"`
+	PresencePenalty      *float64       `json:"presence_penalty,omitempty"`
+	PreviousResponseID   *string        `json:"previous_response_id,omitempty"`
+	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
+	SafetyIdentifier     string         `json:"safety_identifier,omitempty"`
+	Store                *bool          `json:"store,omitempty"`
+	TopLogprobs          *int           `json:"top_logprobs,omitempty"`
+	Truncation           json.RawMessage `json:"truncation,omitempty"`
+	User                 *string        `json:"user,omitempty"`
 }
 
 type OutputItem struct {
