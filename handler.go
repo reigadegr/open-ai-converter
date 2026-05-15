@@ -991,7 +991,6 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 					toolCallMap[idx] = newTC
 					s.finalizeReasoningIfPending()
 					s.toolCallOutputBase[idx] = s.outputIndex
-					s.ensureMessageItemAdded()
 
 					s.emit("response.output_item.added", map[string]interface{}{
 						"type": "response.output_item.added", "output_index": s.outputIndex + idx + 1,
