@@ -297,8 +297,7 @@ func handleChatStreamViaResponses(r *http.Request, w http.ResponseWriter, url, a
 			}
 
 		default:
-			// Unknown event type — skip full deserialization entirely.
-			// ResponsesEventToChatChunks returns nil for unknown types anyway.
+			log.Printf("发现未知事件，类型:%s", typeBuf.Type)
 			continue
 		}
 
