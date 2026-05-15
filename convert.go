@@ -505,6 +505,16 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 						if role == "developer" {
 							role = "system"
 						}
+						// Flush pending reasoning before non-assistant messages
+						// to preserve correct conversation ordering
+						if pendingReasoning != "" && role != "assistant" {
+							rc := pendingReasoning
+							messages = append(messages, ChatMessage{
+								Role:             "assistant",
+								ReasoningContent: &rc,
+							})
+							pendingReasoning = ""
+						}
 						msg := ChatMessage{Role: role}
 						if im.Content != nil {
 							msg.Content = json.RawMessage(mustMarshal(convertResponsesContentToChat(im.Content)))
@@ -525,10 +535,28 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 							msg.ReasoningContent = &rc
 							pendingReasoning = ""
 						}
+						// For assistant messages, normalize empty content to nil
+						// and skip completely empty messages (no content, tool_calls, reasoning, or refusal)
+						if role == "assistant" {
+							if msg.Content != nil && contentToString(msg.Content) == "" && msg.Refusal == nil {
+								msg.Content = nil
+							}
+							if msg.Content == nil && len(msg.ToolCalls) == 0 && msg.ReasoningContent == nil && msg.Refusal == nil {
+								continue
+							}
+						}
 						messages = append(messages, msg)
 					}
 				}
 				flushToolCalls()
+				// Flush any remaining reasoning that wasn't attached to a tool call or message
+				if pendingReasoning != "" {
+					rc := pendingReasoning
+					messages = append(messages, ChatMessage{
+						Role:             "assistant",
+						ReasoningContent: &rc,
+					})
+				}
 			}
 		}
 	}
@@ -1238,6 +1266,15 @@ func cleanupOrphanedToolCalls(messages []ChatMessage) []ChatMessage {
 	cleaned := make([]ChatMessage, 0, len(messages))
 	for _, m := range messages {
 		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			// For assistant messages without tool_calls, skip if completely empty
+			if m.Role == "assistant" {
+				hasContent := m.Content != nil && contentToString(m.Content) != ""
+				hasReasoning := m.ReasoningContent != nil && *m.ReasoningContent != ""
+				hasRefusal := m.Refusal != nil && *m.Refusal != ""
+				if !hasContent && !hasReasoning && !hasRefusal {
+					continue
+				}
+			}
 			cleaned = append(cleaned, m)
 			continue
 		}

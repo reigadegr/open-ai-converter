@@ -1302,3 +1302,202 @@ func TestConvertChatRespToResponsesResp_ReasoningNil(t *testing.T) {
 		t.Errorf("output[0] type = %v, want message", respResp.Output[0].Type)
 	}
 }
+
+// ==================== Empty Assistant Message Prevention Tests ====================
+
+func TestConvertResponsesToChat_EmptyAssistantMessageSkipped(t *testing.T) {
+	// An assistant message with no content should be skipped entirely
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"message","id":"msg_2","role":"assistant","status":"completed"},
+		{"type":"message","id":"msg_3","role":"user","status":"completed","content":[{"type":"input_text","text":"How are you?"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// The empty assistant message should be dropped, leaving only the 2 user messages
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages (empty assistant dropped), got %d", len(chatReq.Messages))
+	}
+	if chatReq.Messages[0].Role != "user" {
+		t.Errorf("msg[0] role = %v, want user", chatReq.Messages[0].Role)
+	}
+	if chatReq.Messages[1].Role != "user" {
+		t.Errorf("msg[1] role = %v, want user", chatReq.Messages[1].Role)
+	}
+}
+
+func TestConvertResponsesToChat_EmptyContentAssistantSkipped(t *testing.T) {
+	// An assistant message with empty content array should be skipped
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"message","id":"msg_2","role":"assistant","status":"completed","content":[]},
+		{"type":"message","id":"msg_3","role":"user","status":"completed","content":[{"type":"input_text","text":"How are you?"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	if len(chatReq.Messages) != 2 {
+		t.Fatalf("expected 2 messages (empty-content assistant dropped), got %d", len(chatReq.Messages))
+	}
+}
+
+func TestConvertResponsesToChat_ReasoningOnlyProducesAssistantMessage(t *testing.T) {
+	// A standalone reasoning item (not followed by assistant message or tool call)
+	// should produce an assistant message with reasoning_content
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"reasoning","id":"r_1","summary":[{"type":"summary_text","text":"I considered the question carefully."}]},
+		{"type":"message","id":"msg_2","role":"user","status":"completed","content":[{"type":"input_text","text":"Follow up"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// Should have: user, assistant (reasoning only), user
+	if len(chatReq.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(chatReq.Messages))
+	}
+
+	// The reasoning should appear as an assistant message between the two user messages
+	assistantMsg := chatReq.Messages[1]
+	if assistantMsg.Role != "assistant" {
+		t.Errorf("msg[1] role = %v, want assistant", assistantMsg.Role)
+	}
+	if assistantMsg.ReasoningContent == nil || *assistantMsg.ReasoningContent != "I considered the question carefully." {
+		t.Errorf("msg[1] reasoning_content = %v, want 'I considered the question carefully.'", assistantMsg.ReasoningContent)
+	}
+	// Verify no empty content is sent
+	if assistantMsg.Content != nil {
+		t.Errorf("msg[1] content should be nil for reasoning-only message, got %v", string(assistantMsg.Content))
+	}
+}
+
+func TestConvertResponsesToChat_AllEmptyAssistantMessagesNeverProduced(t *testing.T) {
+	// Comprehensive test: ensure no assistant message has all three fields empty
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"reasoning","id":"r_1","summary":[{"type":"summary_text","text":"Thinking..."}]},
+		{"type":"function_call","id":"fc_1","call_id":"call_abc","name":"get_weather","arguments":"{\"city\":\"Beijing\"}","status":"completed"},
+		{"type":"function_call_output","call_id":"call_abc","output":"Sunny, 25°C"},
+		{"type":"message","id":"msg_2","role":"assistant","status":"completed"},
+		{"type":"message","id":"msg_3","role":"user","status":"completed","content":[{"type":"input_text","text":"Thanks"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	for i, msg := range chatReq.Messages {
+		if msg.Role == "assistant" {
+			hasContent := msg.Content != nil && contentToString(msg.Content) != ""
+			hasToolCalls := len(msg.ToolCalls) > 0
+			hasReasoning := msg.ReasoningContent != nil && *msg.ReasoningContent != ""
+			hasRefusal := msg.Refusal != nil && *msg.Refusal != ""
+			if !hasContent && !hasToolCalls && !hasReasoning && !hasRefusal {
+				t.Errorf("msg[%d] is an empty assistant message (no content, tool_calls, reasoning_content, or refusal)", i)
+			}
+		}
+	}
+}
+
+func TestConvertResponsesToChat_OrphanedToolCallWithReasoningKept(t *testing.T) {
+	// Reasoning + function_call without function_call_output:
+	// tool_calls should be stripped but reasoning_content preserved
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"reasoning","id":"r_1","summary":[{"type":"summary_text","text":"I need to check something."}]},
+		{"type":"function_call","id":"fc_1","call_id":"call_orphan","name":"get_weather","arguments":"{}","status":"completed"},
+		{"type":"message","id":"msg_2","role":"user","status":"completed","content":[{"type":"input_text","text":"Follow up"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// The assistant message should have reasoning_content but no orphaned tool_calls
+	found := false
+	for _, msg := range chatReq.Messages {
+		if msg.Role == "assistant" {
+			found = true
+			if msg.ReasoningContent == nil || *msg.ReasoningContent != "I need to check something." {
+				t.Errorf("reasoning_content should be preserved, got %v", msg.ReasoningContent)
+			}
+			if len(msg.ToolCalls) != 0 {
+				t.Errorf("orphaned tool_calls should be removed, got %d", len(msg.ToolCalls))
+			}
+			hasContent := msg.Content != nil && contentToString(msg.Content) != ""
+			hasReasoning := msg.ReasoningContent != nil && *msg.ReasoningContent != ""
+			hasRefusal := msg.Refusal != nil && *msg.Refusal != ""
+			if !hasContent && !hasReasoning && !hasRefusal {
+				t.Error("assistant message should have at least content, reasoning_content, or refusal")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected at least one assistant message")
+	}
+}
+
+func TestConvertResponsesToChat_OrphanedToolCallWithEmptyReasoning_Dropped(t *testing.T) {
+	// Reasoning with empty summary + orphaned function_call: should be dropped
+	inputJSON := `[
+		{"type":"message","id":"msg_1","role":"user","status":"completed","content":[{"type":"input_text","text":"Hello"}]},
+		{"type":"reasoning","id":"r_1","summary":[]},
+		{"type":"function_call","id":"fc_1","call_id":"call_orphan","name":"get_weather","arguments":"{}","status":"completed"},
+		{"type":"message","id":"msg_2","role":"user","status":"completed","content":[{"type":"input_text","text":"Follow up"}]}
+	]`
+
+	respReq := &ResponsesRequest{
+		Model: "o3",
+		Input: json.RawMessage(inputJSON),
+	}
+
+	chatReq, err := ConvertResponsesToChatRequest(respReq)
+	if err != nil {
+		t.Fatalf("conversion error: %v", err)
+	}
+
+	// No assistant message should be present since reasoning was empty and tool_calls orphaned
+	for _, msg := range chatReq.Messages {
+		if msg.Role == "assistant" {
+			t.Errorf("should not have assistant message, but found one with content=%v reasoning=%v tool_calls=%d",
+				msg.Content, msg.ReasoningContent, len(msg.ToolCalls))
+		}
+	}
+}
