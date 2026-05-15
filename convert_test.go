@@ -1188,6 +1188,29 @@ func TestCleanupOrphanedToolCalls(t *testing.T) {
 		}
 	})
 
+	t.Run("orphaned tool_call with refusal: keep message, remove tool_calls", func(t *testing.T) {
+		msgs := []ChatMessage{
+			{
+				Role:    "assistant",
+				Content: json.RawMessage("null"),
+				Refusal: strPtr("I cannot help with that request."),
+				ToolCalls: []ToolCall{
+					{ID: "call_orphan", Type: "function", Function: FunctionCall{Name: "f1", Arguments: "{}"}},
+				},
+			},
+		}
+		result := cleanupOrphanedToolCalls(msgs)
+		if len(result) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(result))
+		}
+		if len(result[0].ToolCalls) != 0 {
+			t.Errorf("tool_calls should be removed, got %d", len(result[0].ToolCalls))
+		}
+		if result[0].Refusal == nil || *result[0].Refusal != "I cannot help with that request." {
+			t.Errorf("refusal should be preserved, got %v", result[0].Refusal)
+		}
+	})
+
 	t.Run("orphaned tool_call with no content or reasoning: delete message", func(t *testing.T) {
 		msgs := []ChatMessage{
 			{

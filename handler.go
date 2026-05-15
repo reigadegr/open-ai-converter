@@ -620,6 +620,99 @@ func buildBaseResponse(respReq *ResponsesRequest, responseID string, created int
 	return base
 }
 
+// streamState encapsulates all mutable state for handleResponsesStreamViaChat.
+type streamState struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+
+	// Sequence and index tracking
+	seqNum       int
+	outputIndex  int
+	contentIndex int
+
+	// IDs
+	msgID       string
+	reasoningID string
+
+	// Reasoning state
+	hasReasoningContent bool
+	reasoningEmitted    bool
+	reasoningDone       bool
+
+	// Message state
+	messageItemAdded bool
+	messageItemDone  bool
+	contentPartAdded bool
+	contentType      string
+
+	// Tool call state
+	toolCallOutputBase map[int]int
+
+	// Accumulators
+	fullText      strings.Builder
+	fullRefusal   strings.Builder
+	fullReasoning strings.Builder
+}
+
+// emit writes an SSE event and flushes, incrementing seqNum.
+func (s *streamState) emit(event string, data interface{}) {
+	writeResponsesSSE(s.w, event, data)
+	s.flusher.Flush()
+	s.seqNum++
+}
+
+// finalizeReasoningIfPending closes the reasoning item if it was emitted but not yet done.
+func (s *streamState) finalizeReasoningIfPending() {
+	if !s.hasReasoningContent || s.reasoningDone {
+		return
+	}
+	s.reasoningDone = true
+	s.reasoningEmitted = false
+	reasoningText := s.fullReasoning.String()
+
+	s.emit("response.reasoning_summary_text.done", map[string]interface{}{
+		"type": "response.reasoning_summary_text.done", "summary_index": 0,
+		"item_id": s.reasoningID, "output_index": s.outputIndex,
+		"text": reasoningText, "sequence_number": s.seqNum,
+	})
+	s.emit("response.reasoning_summary_part.done", map[string]interface{}{
+		"type": "response.reasoning_summary_part.done", "summary_index": 0,
+		"item_id": s.reasoningID, "output_index": s.outputIndex,
+		"part": map[string]interface{}{
+			"type": "summary_text", "text": reasoningText,
+		},
+		"sequence_number": s.seqNum,
+	})
+	s.emit("response.output_item.done", map[string]interface{}{
+		"type": "response.output_item.done", "output_index": s.outputIndex,
+		"item": map[string]interface{}{
+			"id": s.reasoningID, "type": "reasoning", "status": "completed",
+			"summary": []interface{}{
+				map[string]interface{}{"type": "summary_text", "text": reasoningText},
+			},
+		},
+		"sequence_number": s.seqNum,
+	})
+	s.outputIndex++
+	s.contentIndex = 0
+}
+
+// ensureMessageItemAdded emits output_item.added for the message if not yet emitted.
+func (s *streamState) ensureMessageItemAdded() {
+	if s.messageItemAdded {
+		return
+	}
+	s.messageItemAdded = true
+	s.emit("response.output_item.added", map[string]interface{}{
+		"type": "response.output_item.added", "output_index": s.outputIndex,
+		"item": map[string]interface{}{
+			"id": s.msgID, "type": "message", "status": "in_progress",
+			"content": []interface{}{}, "role": "assistant",
+		},
+		"sequence_number": s.seqNum,
+	})
+}
+
 func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, apiKey string, reqBody []byte, respReq *ResponsesRequest) {
 	var sseStarted bool
 	defer func() {
@@ -717,48 +810,35 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	sseStarted = true
 
 	responseID := generateID("resp_")
-	msgID := generateID("msg_")
 	created := nowUnix()
-	seqNum := 0
+
+	s := &streamState{
+		w:                  w,
+		flusher:            flusher,
+		msgID:              generateID("msg_"),
+		toolCallOutputBase: make(map[int]int),
+	}
 
 	baseResponse := buildBaseResponse(respReq, responseID, created, "in_progress")
 
 	// response.created
-	writeResponsesSSE(w, "response.created", map[string]interface{}{
-		"type": "response.created", "response": baseResponse, "sequence_number": seqNum,
+	s.emit("response.created", map[string]interface{}{
+		"type": "response.created", "response": baseResponse, "sequence_number": s.seqNum,
 	})
-	flusher.Flush()
-	seqNum++
 
 	// response.in_progress
-	writeResponsesSSE(w, "response.in_progress", map[string]interface{}{
-		"type": "response.in_progress", "response": baseResponse, "sequence_number": seqNum,
+	s.emit("response.in_progress", map[string]interface{}{
+		"type": "response.in_progress", "response": baseResponse, "sequence_number": s.seqNum,
 	})
-	flusher.Flush()
-	seqNum++
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
-	var fullText strings.Builder
-	var fullRefusal strings.Builder
-	var fullReasoning strings.Builder
 	var chatUsage *ChatUsage
 	var toolCalls []ToolCall
 	toolCallMap := make(map[int]*ToolCall)
 	var finishReason string
 	var finishReasonSeen bool
-	var contentPartAdded bool
-	var contentType string // "output_text" or "refusal"
-	var contentIndex int   // tracks content part index within an output item
-	var outputIndex int    // tracks output item index (accounts for reasoning item)
-	var reasoningID string
-	var reasoningEmitted bool
-	var hasReasoningContent bool
-	var reasoningDone bool
-	var messageItemAdded bool
-	var messageItemDone bool
-	toolCallOutputBase := make(map[int]int)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -795,197 +875,91 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			// Reasoning content — stream as reasoning output item
 			if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
 				reasoningDelta := *choice.Delta.ReasoningContent
-				fullReasoning.WriteString(reasoningDelta)
-				hasReasoningContent = true
+				s.fullReasoning.WriteString(reasoningDelta)
+				s.hasReasoningContent = true
 
-				if !reasoningEmitted {
-					reasoningEmitted = true
-					reasoningID = generateID("rs_")
-					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added", "output_index": outputIndex,
+				if !s.reasoningEmitted {
+					s.reasoningEmitted = true
+					s.reasoningID = generateID("rs_")
+					s.emit("response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added", "output_index": s.outputIndex,
 						"item": map[string]interface{}{
-							"id": reasoningID, "type": "reasoning", "status": "in_progress",
+							"id": s.reasoningID, "type": "reasoning", "status": "in_progress",
 							"summary": []interface{}{},
 						},
-						"sequence_number": seqNum,
+						"sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
-					writeResponsesSSE(w, "response.reasoning_summary_part.added", map[string]interface{}{
+					s.emit("response.reasoning_summary_part.added", map[string]interface{}{
 						"type": "response.reasoning_summary_part.added", "summary_index": 0,
-						"item_id": reasoningID, "output_index": outputIndex,
+						"item_id": s.reasoningID, "output_index": s.outputIndex,
 						"part": map[string]interface{}{
 							"type": "summary_text", "text": "",
 						},
-						"sequence_number": seqNum,
+						"sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
 				}
 
-				writeResponsesSSE(w, "response.reasoning_summary_text.delta", map[string]interface{}{
+				s.emit("response.reasoning_summary_text.delta", map[string]interface{}{
 					"type": "response.reasoning_summary_text.delta", "summary_index": 0,
-					"item_id": reasoningID, "output_index": outputIndex,
-					"delta": reasoningDelta, "sequence_number": seqNum,
+					"item_id": s.reasoningID, "output_index": s.outputIndex,
+					"delta": reasoningDelta, "sequence_number": s.seqNum,
 				})
-				flusher.Flush()
-				seqNum++
 			}
 
 			// Text content
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				// reasoning → content transition: finalize reasoning item
-				if hasReasoningContent && !reasoningDone {
-					reasoningDone = true
-					reasoningEmitted = false
-					writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
-						"type": "response.reasoning_summary_text.done", "summary_index": 0,
-						"item_id": reasoningID, "output_index": outputIndex,
-						"text": fullReasoning.String(), "sequence_number": seqNum,
-					})
-					flusher.Flush()
-					seqNum++
-					writeResponsesSSE(w, "response.reasoning_summary_part.done", map[string]interface{}{
-						"type": "response.reasoning_summary_part.done", "summary_index": 0,
-						"item_id": reasoningID, "output_index": outputIndex,
-						"part": map[string]interface{}{
-							"type": "summary_text", "text": fullReasoning.String(),
-						},
-						"sequence_number": seqNum,
-					})
-					flusher.Flush()
-					seqNum++
-					writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-						"type": "response.output_item.done", "output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id": reasoningID, "type": "reasoning", "status": "completed",
-							"summary": []interface{}{
-								map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
-							},
-						},
-						"sequence_number": seqNum,
-					})
-					flusher.Flush()
-					seqNum++
-					outputIndex++
-					contentIndex = 0
-				}
+				s.finalizeReasoningIfPending()
 
 				delta := *choice.Delta.Content
-				fullText.WriteString(delta)
+				s.fullText.WriteString(delta)
 
-				if !contentPartAdded {
-					contentPartAdded = true
-					if !messageItemAdded {
-						messageItemAdded = true
-						writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-							"type": "response.output_item.added", "output_index": outputIndex,
-							"item": map[string]interface{}{
-								"id": msgID, "type": "message", "status": "in_progress",
-								"content": []interface{}{}, "role": "assistant",
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-					}
-					contentType = "output_text"
-					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
-						"type": "response.content_part.added", "content_index": contentIndex,
-						"item_id": msgID, "output_index": outputIndex,
+				if !s.contentPartAdded {
+					s.contentPartAdded = true
+					s.ensureMessageItemAdded()
+					s.contentType = "output_text"
+					s.emit("response.content_part.added", map[string]interface{}{
+						"type": "response.content_part.added", "content_index": s.contentIndex,
+						"item_id": s.msgID, "output_index": s.outputIndex,
 						"part": map[string]interface{}{
 							"type": "output_text", "annotations": []interface{}{}, "text": "",
 						},
-						"sequence_number": seqNum,
+						"sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
 				}
 
-				writeResponsesSSE(w, "response.output_text.delta", map[string]interface{}{
-					"type": "response.output_text.delta", "content_index": contentIndex,
-					"item_id": msgID, "output_index": outputIndex,
-					"delta": delta, "sequence_number": seqNum,
+				s.emit("response.output_text.delta", map[string]interface{}{
+					"type": "response.output_text.delta", "content_index": s.contentIndex,
+					"item_id": s.msgID, "output_index": s.outputIndex,
+					"delta": delta, "sequence_number": s.seqNum,
 				})
-				flusher.Flush()
-				seqNum++
 			}
 
 			// Refusal
 			if choice.Delta.Refusal != nil && *choice.Delta.Refusal != "" {
 				refusalDelta := *choice.Delta.Refusal
-				fullRefusal.WriteString(refusalDelta)
+				s.fullRefusal.WriteString(refusalDelta)
 
-				if !contentPartAdded {
-					contentPartAdded = true
-					if hasReasoningContent && !reasoningDone {
-						reasoningDone = true
-						reasoningEmitted = false
-						writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
-							"type": "response.reasoning_summary_text.done", "summary_index": 0,
-							"item_id": reasoningID, "output_index": outputIndex,
-							"text": fullReasoning.String(), "sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						writeResponsesSSE(w, "response.reasoning_summary_part.done", map[string]interface{}{
-							"type": "response.reasoning_summary_part.done", "summary_index": 0,
-							"item_id": reasoningID, "output_index": outputIndex,
-							"part": map[string]interface{}{
-								"type": "summary_text", "text": fullReasoning.String(),
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-							"type": "response.output_item.done", "output_index": outputIndex,
-							"item": map[string]interface{}{
-								"id": reasoningID, "type": "reasoning", "status": "completed",
-								"summary": []interface{}{
-									map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
-								},
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						outputIndex++
-						contentIndex = 0
-					}
-					if !messageItemAdded {
-						messageItemAdded = true
-						writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-							"type": "response.output_item.added", "output_index": outputIndex,
-							"item": map[string]interface{}{
-								"id": msgID, "type": "message", "status": "in_progress",
-								"content": []interface{}{}, "role": "assistant",
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-					}
-					contentType = "refusal"
-					writeResponsesSSE(w, "response.content_part.added", map[string]interface{}{
-						"type": "response.content_part.added", "content_index": contentIndex,
-						"item_id": msgID, "output_index": outputIndex,
+				if !s.contentPartAdded {
+					s.contentPartAdded = true
+					s.finalizeReasoningIfPending()
+					s.ensureMessageItemAdded()
+					s.contentType = "refusal"
+					s.emit("response.content_part.added", map[string]interface{}{
+						"type": "response.content_part.added", "content_index": s.contentIndex,
+						"item_id": s.msgID, "output_index": s.outputIndex,
 						"part": map[string]interface{}{
 							"type": "refusal", "refusal": "",
 						},
-						"sequence_number": seqNum,
+						"sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
 				}
 
-				writeResponsesSSE(w, "response.refusal.delta", map[string]interface{}{
-					"type": "response.refusal.delta", "content_index": contentIndex,
-					"item_id": msgID, "output_index": outputIndex,
-					"delta": refusalDelta, "sequence_number": seqNum,
+				s.emit("response.refusal.delta", map[string]interface{}{
+					"type": "response.refusal.delta", "content_index": s.contentIndex,
+					"item_id": s.msgID, "output_index": s.outputIndex,
+					"delta": refusalDelta, "sequence_number": s.seqNum,
 				})
-				flusher.Flush()
-				seqNum++
 			}
 
 			// Tool calls
@@ -997,13 +971,11 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 				if existing, ok := toolCallMap[idx]; ok {
 					existing.Function.Arguments += tc.Function.Arguments
 
-					writeResponsesSSE(w, "response.function_call_arguments.delta", map[string]interface{}{
+					s.emit("response.function_call_arguments.delta", map[string]interface{}{
 						"type":    "response.function_call_arguments.delta",
-						"item_id": existing.ID, "output_index": outputIndex + idx + 1,
-						"delta": tc.Function.Arguments, "sequence_number": seqNum,
+						"item_id": existing.ID, "output_index": s.outputIndex + idx + 1,
+						"delta": tc.Function.Arguments, "sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
 				} else {
 					callID := tc.ID
 					if callID == "" {
@@ -1018,75 +990,25 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 						},
 					}
 					toolCallMap[idx] = newTC
-					toolCallOutputBase[idx] = outputIndex
-					if hasReasoningContent && !reasoningDone {
-						reasoningDone = true
-						reasoningEmitted = false
-						writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
-							"type": "response.reasoning_summary_text.done", "summary_index": 0,
-							"item_id": reasoningID, "output_index": outputIndex,
-							"text": fullReasoning.String(), "sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						writeResponsesSSE(w, "response.reasoning_summary_part.done", map[string]interface{}{
-							"type": "response.reasoning_summary_part.done", "summary_index": 0,
-							"item_id": reasoningID, "output_index": outputIndex,
-							"part": map[string]interface{}{
-								"type": "summary_text", "text": fullReasoning.String(),
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-							"type": "response.output_item.done", "output_index": outputIndex,
-							"item": map[string]interface{}{
-								"id": reasoningID, "type": "reasoning", "status": "completed",
-								"summary": []interface{}{
-									map[string]interface{}{"type": "summary_text", "text": fullReasoning.String()},
-								},
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-						outputIndex++
-						contentIndex = 0
-					}
-					if !messageItemAdded {
-						messageItemAdded = true
-						writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-							"type": "response.output_item.added", "output_index": outputIndex,
-							"item": map[string]interface{}{
-								"id": msgID, "type": "message", "status": "in_progress",
-								"content": []interface{}{}, "role": "assistant",
-							},
-							"sequence_number": seqNum,
-						})
-						flusher.Flush()
-						seqNum++
-					}
+					s.finalizeReasoningIfPending()
+					s.toolCallOutputBase[idx] = s.outputIndex
+					s.ensureMessageItemAdded()
 
-					writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-						"type": "response.output_item.added", "output_index": outputIndex + idx + 1,
+					s.emit("response.output_item.added", map[string]interface{}{
+						"type": "response.output_item.added", "output_index": s.outputIndex + idx + 1,
 						"item": map[string]interface{}{
 							"id": callID, "type": "function_call", "status": "in_progress",
 							"call_id": callID, "name": tc.Function.Name, "arguments": "",
 						},
-						"sequence_number": seqNum,
+						"sequence_number": s.seqNum,
 					})
-					flusher.Flush()
-					seqNum++
 
 					if tc.Function.Arguments != "" {
-						writeResponsesSSE(w, "response.function_call_arguments.delta", map[string]interface{}{
+						s.emit("response.function_call_arguments.delta", map[string]interface{}{
 							"type":    "response.function_call_arguments.delta",
-							"item_id": callID, "output_index": outputIndex + idx + 1,
-							"delta": tc.Function.Arguments, "sequence_number": seqNum,
+							"item_id": callID, "output_index": s.outputIndex + idx + 1,
+							"delta": tc.Function.Arguments, "sequence_number": s.seqNum,
 						})
-						flusher.Flush()
-						seqNum++
 					}
 				}
 			}
@@ -1099,14 +1021,14 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		completedAt := time.Now().Unix()
 		completedResponse["completed_at"] = completedAt
 		completedResponse["incomplete_details"] = map[string]interface{}{"reason": "upstream_stream_error"}
-		writeResponsesSSE(w, "response.completed", map[string]interface{}{
-			"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+		s.emit("response.completed", map[string]interface{}{
+			"type": "response.completed", "response": completedResponse, "sequence_number": s.seqNum,
 		})
 		writeSSEError(w, flusher, http.StatusInternalServerError, fmt.Sprintf("upstream stream error: %v", err))
 		return
 	}
 
-	reasoningText := fullReasoning.String()
+	reasoningText := s.fullReasoning.String()
 
 	// Finalize tool calls in deterministic order
 	toolCallIndices := make([]int, 0, len(toolCallMap))
@@ -1119,118 +1041,65 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 		tc := toolCallMap[idx]
 		toolCalls = append(toolCalls, *tc)
 
-		base := toolCallOutputBase[idx]
+		base := s.toolCallOutputBase[idx]
 
-		writeResponsesSSE(w, "response.function_call_arguments.done", map[string]interface{}{
+		s.emit("response.function_call_arguments.done", map[string]interface{}{
 			"type":    "response.function_call_arguments.done",
 			"item_id": tc.ID, "output_index": base + idx + 1,
-			"arguments": tc.Function.Arguments, "sequence_number": seqNum,
+			"arguments": tc.Function.Arguments, "sequence_number": s.seqNum,
 		})
-		flusher.Flush()
-		seqNum++
 
-		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
+		s.emit("response.output_item.done", map[string]interface{}{
 			"type": "response.output_item.done", "output_index": base + idx + 1,
 			"item": map[string]interface{}{
 				"id": tc.ID, "type": "function_call", "status": "completed",
 				"call_id": tc.ID, "name": tc.Function.Name, "arguments": tc.Function.Arguments,
 			},
-			"sequence_number": seqNum,
+			"sequence_number": s.seqNum,
 		})
-		flusher.Flush()
-		seqNum++
 	}
 
 	// Finalize reasoning output item if still open (stream ended without text content)
-	if hasReasoningContent && reasoningEmitted {
-		reasoningDone = true
-		reasoningEmitted = false
-		writeResponsesSSE(w, "response.reasoning_summary_text.done", map[string]interface{}{
-			"type": "response.reasoning_summary_text.done", "summary_index": 0,
-			"item_id": reasoningID, "output_index": outputIndex,
-			"text": reasoningText, "sequence_number": seqNum,
-		})
-		flusher.Flush()
-		seqNum++
-		writeResponsesSSE(w, "response.reasoning_summary_part.done", map[string]interface{}{
-			"type": "response.reasoning_summary_part.done", "summary_index": 0,
-			"item_id": reasoningID, "output_index": outputIndex,
-			"part": map[string]interface{}{
-				"type": "summary_text", "text": reasoningText,
-			},
-			"sequence_number": seqNum,
-		})
-		flusher.Flush()
-		seqNum++
-		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-			"type": "response.output_item.done", "output_index": outputIndex,
-			"item": map[string]interface{}{
-				"id": reasoningID, "type": "reasoning", "status": "completed",
-				"summary": []interface{}{
-					map[string]interface{}{"type": "summary_text", "text": reasoningText},
-				},
-			},
-			"sequence_number": seqNum,
-		})
-		flusher.Flush()
-		seqNum++
-		outputIndex++
-		if !messageItemAdded {
-			messageItemAdded = true
-			writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-				"type": "response.output_item.added", "output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id": msgID, "type": "message", "status": "in_progress",
-					"content": []interface{}{}, "role": "assistant",
-				},
-				"sequence_number": seqNum,
-			})
-			flusher.Flush()
-			seqNum++
-		}
+	if s.hasReasoningContent && s.reasoningEmitted {
+		s.finalizeReasoningIfPending()
+		s.ensureMessageItemAdded()
 	}
 
 	// Display text: content preferred, reasoning fallback
-	displayText := fullText.String()
+	displayText := s.fullText.String()
 	if displayText == "" && reasoningText != "" {
 		displayText = reasoningText
 	}
 
 	// Finalize message content
-	if contentPartAdded {
-		if contentType == "refusal" {
-			writeResponsesSSE(w, "response.refusal.done", map[string]interface{}{
-				"type": "response.refusal.done", "content_index": contentIndex,
-				"item_id": msgID, "output_index": outputIndex,
-				"refusal": fullRefusal.String(), "sequence_number": seqNum,
+	if s.contentPartAdded {
+		if s.contentType == "refusal" {
+			s.emit("response.refusal.done", map[string]interface{}{
+				"type": "response.refusal.done", "content_index": s.contentIndex,
+				"item_id": s.msgID, "output_index": s.outputIndex,
+				"refusal": s.fullRefusal.String(), "sequence_number": s.seqNum,
 			})
-			flusher.Flush()
-			seqNum++
 
-			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-				"type": "response.content_part.done", "content_index": contentIndex,
-				"item_id": msgID, "output_index": outputIndex,
+			s.emit("response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": s.contentIndex,
+				"item_id": s.msgID, "output_index": s.outputIndex,
 				"part": map[string]interface{}{
-					"type": "refusal", "refusal": fullRefusal.String(),
+					"type": "refusal", "refusal": s.fullRefusal.String(),
 				},
-				"sequence_number": seqNum,
+				"sequence_number": s.seqNum,
 			})
-			flusher.Flush()
-			seqNum++
 		} else {
 			donePartType := "output_text"
 			doneText := displayText
-			if fullText.Len() == 0 && hasReasoningContent {
+			if s.fullText.Len() == 0 && s.hasReasoningContent {
 				donePartType = "reasoning_text"
 			}
 
-			writeResponsesSSE(w, "response."+donePartType+".done", map[string]interface{}{
-				"type": "response." + donePartType + ".done", "content_index": contentIndex,
-				"item_id": msgID, "output_index": outputIndex,
-				"text": doneText, "sequence_number": seqNum,
+			s.emit("response."+donePartType+".done", map[string]interface{}{
+				"type": "response." + donePartType + ".done", "content_index": s.contentIndex,
+				"item_id": s.msgID, "output_index": s.outputIndex,
+				"text": doneText, "sequence_number": s.seqNum,
 			})
-			flusher.Flush()
-			seqNum++
 
 			donePart := map[string]interface{}{
 				"type": donePartType, "text": doneText,
@@ -1238,81 +1107,63 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			if donePartType == "output_text" {
 				donePart["annotations"] = []interface{}{}
 			}
-			writeResponsesSSE(w, "response.content_part.done", map[string]interface{}{
-				"type": "response.content_part.done", "content_index": contentIndex,
-				"item_id": msgID, "output_index": outputIndex,
-				"part": donePart, "sequence_number": seqNum,
+			s.emit("response.content_part.done", map[string]interface{}{
+				"type": "response.content_part.done", "content_index": s.contentIndex,
+				"item_id": s.msgID, "output_index": s.outputIndex,
+				"part": donePart, "sequence_number": s.seqNum,
 			})
-			flusher.Flush()
-			seqNum++
 		}
 
-		if !messageItemAdded {
-			messageItemAdded = true
-			writeResponsesSSE(w, "response.output_item.added", map[string]interface{}{
-				"type": "response.output_item.added", "output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id": msgID, "type": "message", "status": "in_progress",
-					"content": []interface{}{}, "role": "assistant",
-				},
-				"sequence_number": seqNum,
-			})
-			flusher.Flush()
-			seqNum++
-		}
+		s.ensureMessageItemAdded()
 
 		// output_item.done for message
 		var finalContent []map[string]interface{}
-		if contentType == "refusal" {
+		if s.contentType == "refusal" {
 			finalContent = []map[string]interface{}{
-				{"type": "refusal", "refusal": fullRefusal.String()},
+				{"type": "refusal", "refusal": s.fullRefusal.String()},
 			}
 		} else if displayText != "" {
 			finalContent = []map[string]interface{}{
 				{"type": "output_text", "text": displayText, "annotations": []interface{}{}},
 			}
 		}
-		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-			"type": "response.output_item.done", "output_index": outputIndex,
+		s.emit("response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "output_index": s.outputIndex,
 			"item": map[string]interface{}{
-				"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+				"id": s.msgID, "type": "message", "status": "completed", "role": "assistant",
 				"content": finalContent,
 			},
-			"sequence_number": seqNum,
+			"sequence_number": s.seqNum,
 		})
-		flusher.Flush()
-		seqNum++
-		messageItemDone = true
-	} else if messageItemAdded && !messageItemDone {
-		writeResponsesSSE(w, "response.output_item.done", map[string]interface{}{
-			"type": "response.output_item.done", "output_index": outputIndex,
+		s.messageItemDone = true
+	} else if s.messageItemAdded && !s.messageItemDone {
+		s.emit("response.output_item.done", map[string]interface{}{
+			"type": "response.output_item.done", "output_index": s.outputIndex,
 			"item": map[string]interface{}{
-				"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+				"id": s.msgID, "type": "message", "status": "completed", "role": "assistant",
 				"content": []interface{}{},
 			},
-			"sequence_number": seqNum,
+			"sequence_number": s.seqNum,
 		})
-		flusher.Flush()
-		seqNum++
-		messageItemDone = true
+		s.messageItemDone = true
 	}
 
 	// Build final output items for response.completed
 	var outputItems []interface{}
-	if hasReasoningContent {
+	if s.hasReasoningContent {
 		outputItems = append(outputItems, map[string]interface{}{
-			"id": reasoningID, "type": "reasoning", "status": "completed",
+			"id": s.reasoningID, "type": "reasoning", "status": "completed",
 			"encrypted_content": "", "summary": []interface{}{
 				map[string]interface{}{"type": "summary_text", "text": reasoningText},
 			},
 		})
 	}
-	if messageItemAdded {
+	if s.messageItemAdded {
 		var msgContent []map[string]interface{}
-		if contentPartAdded {
-			if contentType == "refusal" {
+		if s.contentPartAdded {
+			if s.contentType == "refusal" {
 				msgContent = []map[string]interface{}{
-					{"type": "refusal", "refusal": fullRefusal.String()},
+					{"type": "refusal", "refusal": s.fullRefusal.String()},
 				}
 			} else if displayText != "" {
 				msgContent = []map[string]interface{}{
@@ -1321,7 +1172,7 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 			}
 		}
 		outputItems = append(outputItems, map[string]interface{}{
-			"id": msgID, "type": "message", "status": "completed", "role": "assistant",
+			"id": s.msgID, "type": "message", "status": "completed", "role": "assistant",
 			"content": msgContent,
 		})
 	}
@@ -1361,10 +1212,9 @@ func handleResponsesStreamViaChat(r *http.Request, w http.ResponseWriter, url, a
 	completedResponse["output"] = outputItems
 	completedResponse["output_text"] = displayText
 	completedResponse["usage"] = usage
-	writeResponsesSSE(w, "response.completed", map[string]interface{}{
-		"type": "response.completed", "response": completedResponse, "sequence_number": seqNum,
+	s.emit("response.completed", map[string]interface{}{
+		"type": "response.completed", "response": completedResponse, "sequence_number": s.seqNum,
 	})
-	flusher.Flush()
 }
 
 // ==================== Pass-through ====================

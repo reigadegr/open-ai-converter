@@ -541,7 +541,7 @@ func ConvertResponsesToChatRequest(respReq *ResponsesRequest) (*ChatCompletionsR
 							if msg.Content != nil && contentToString(msg.Content) == "" && msg.Refusal == nil {
 								msg.Content = nil
 							}
-							if msg.Content == nil && len(msg.ToolCalls) == 0 && msg.ReasoningContent == nil && msg.Refusal == nil {
+							if isEmptyAssistantMessage(msg) {
 								continue
 							}
 						}
@@ -1250,6 +1250,26 @@ func convertTextToResponseFormat(text json.RawMessage) interface{} {
 	}
 }
 
+// isEmptyAssistantMessage returns true if an assistant message carries no useful payload.
+func isEmptyAssistantMessage(m ChatMessage) bool {
+	if m.Role != "assistant" {
+		return false
+	}
+	if m.Content != nil && contentToString(m.Content) != "" {
+		return false
+	}
+	if len(m.ToolCalls) > 0 {
+		return false
+	}
+	if m.ReasoningContent != nil && *m.ReasoningContent != "" {
+		return false
+	}
+	if m.Refusal != nil && *m.Refusal != "" {
+		return false
+	}
+	return true
+}
+
 // cleanupOrphanedToolCalls removes tool_calls from assistant messages that lack
 // matching tool result messages, and removes tool result messages that reference
 // tool_calls no longer present. This prevents upstream API 400 errors when
@@ -1267,13 +1287,8 @@ func cleanupOrphanedToolCalls(messages []ChatMessage) []ChatMessage {
 	for _, m := range messages {
 		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
 			// For assistant messages without tool_calls, skip if completely empty
-			if m.Role == "assistant" {
-				hasContent := m.Content != nil && contentToString(m.Content) != ""
-				hasReasoning := m.ReasoningContent != nil && *m.ReasoningContent != ""
-				hasRefusal := m.Refusal != nil && *m.Refusal != ""
-				if !hasContent && !hasReasoning && !hasRefusal {
-					continue
-				}
+			if isEmptyAssistantMessage(m) {
+				continue
 			}
 			cleaned = append(cleaned, m)
 			continue
@@ -1294,11 +1309,10 @@ func cleanupOrphanedToolCalls(messages []ChatMessage) []ChatMessage {
 		}
 
 		// All tool_calls are orphaned. Keep the message only if it has
-		// text content or reasoning content; otherwise drop it entirely.
-		hasContent := m.Content != nil && contentToString(m.Content) != ""
-		hasReasoning := m.ReasoningContent != nil && *m.ReasoningContent != ""
-
-		if hasContent || hasReasoning {
+		// text content, reasoning content, or refusal; otherwise drop it entirely.
+		tmp := m
+		tmp.ToolCalls = nil
+		if !isEmptyAssistantMessage(tmp) {
 			m.ToolCalls = nil
 			cleaned = append(cleaned, m)
 		}
